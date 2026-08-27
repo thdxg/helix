@@ -185,7 +185,12 @@ The following statusline elements can be configured:
 ### `[editor.cursor-shape]` Section
 
 Defines the shape of cursor in each mode.
-Valid values for these options are `block`, `bar`, `underline`, or `hidden`.
+Valid values for these options are `block`, `bar`, `underline`, `hidden`, or `native`.
+
+`native` leaves the cursor to the terminal, which uses whatever shape is
+configured in the terminal's own settings. Because the cursor is then a real
+terminal cursor, terminal cursor effects such as trails keep working, as does
+accessibility tooling that tracks the native cursor.
 
 > 💡 Due to limitations of the terminal environment, only the primary cursor can
 > change shape.
