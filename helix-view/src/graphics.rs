@@ -61,6 +61,12 @@ pub enum CursorKind {
     Underline,
     /// Hidden cursor, can set cursor position with this to let IME have correct cursor position.
     Hidden,
+    /// The terminal's own cursor, in whatever shape the user configured there.
+    ///
+    /// Unlike the other shapes this leaves the primary cursor to the terminal
+    /// entirely, so terminal cursor effects (trails, blink settings) and
+    /// accessibility tooling that follows the native cursor keep working.
+    Native,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
