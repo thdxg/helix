@@ -47,12 +47,15 @@ use helix_core::{
 use helix_view::{
     editor::Action,
     graphics::{CursorKind, Margin, Modifier, Rect},
+    media::{GraphicsMode, MediaKind, MediaState},
     theme::Style,
     view::ViewPosition,
     Document, DocumentId, Editor,
 };
 
-use self::handlers::{DynamicQueryChange, DynamicQueryHandler, PreviewHighlightHandler};
+use self::handlers::{
+    DynamicQueryChange, DynamicQueryHandler, PreviewHighlightHandler, PreviewMediaHandler,
+};
 
 pub const ID: &str = "picker";
 
@@ -86,9 +89,27 @@ pub type FileLocation<'a> = (PathOrId<'a>, Option<(usize, usize)>);
 pub enum CachedPreview {
     Document(Box<Document>),
     Directory(Vec<(String, bool)>),
+    /// An image or PDF, rendered graphically rather than as text.
+    Media(MediaPreview),
     Binary,
     LargeFile,
     NotFound,
+}
+
+/// An image or the first page of a PDF. Rasterizing runs off the main thread
+/// (it shells out to `magick`/`pdftoppm`), so the preview starts out pending
+/// and is filled in by [`handlers::PreviewMediaHandler`].
+pub enum MediaPreview {
+    /// Not rasterized yet. `started` guards against kicking off a second
+    /// rasterize for a page that is already being worked on.
+    Rendering {
+        kind: MediaKind,
+        started: bool,
+    },
+    Ready(Box<MediaState>),
+    /// Rasterizing failed, or the terminal cannot display images: the reason,
+    /// shown in place of the preview.
+    Unavailable(String),
 }
 
 // We don't store this enum in the cache so as to avoid lifetime constraints
@@ -114,6 +135,17 @@ impl Preview<'_, '_> {
         }
     }
 
+    /// The rasterized image or PDF page to draw, if this preview is one. Media
+    /// files already open in the editor keep their state on the document, so
+    /// the picker draws whichever page the document is on.
+    fn media(&self) -> Option<&MediaState> {
+        match self {
+            Preview::EditorDocument(doc) => doc.media.as_ref(),
+            Preview::Cached(CachedPreview::Media(MediaPreview::Ready(media))) => Some(media),
+            _ => None,
+        }
+    }
+
     /// Alternate text to show for the preview.
     fn placeholder(&self) -> &str {
         match *self {
@@ -121,6 +153,12 @@ impl Preview<'_, '_> {
             Self::Cached(preview) => match preview {
                 CachedPreview::Document(_) => "<Invalid file location>",
                 CachedPreview::Directory(_) => "<Invalid directory location>",
+                CachedPreview::Media(MediaPreview::Rendering { kind, .. }) => match kind {
+                    MediaKind::Pdf => "<Rendering PDF\u{2026}>",
+                    MediaKind::Image => "<Rendering image\u{2026}>",
+                },
+                CachedPreview::Media(MediaPreview::Ready(_)) => "<Invalid file location>",
+                CachedPreview::Media(MediaPreview::Unavailable(reason)) => reason,
                 CachedPreview::Binary => "<Binary file>",
                 CachedPreview::LargeFile => "<File too large to preview>",
                 CachedPreview::NotFound => "<File not found>",
@@ -268,6 +306,8 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     file_fn: Option<FileCallback<T>>,
     /// An event handler for syntax highlighting the currently previewed file.
     preview_highlight_handler: Sender<Arc<Path>>,
+    /// An event handler for rasterizing the currently previewed image or PDF.
+    preview_media_handler: Sender<Arc<Path>>,
     dynamic_query_handler: Option<Sender<DynamicQueryChange>>,
 }
 
@@ -393,6 +433,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             read_buffer: Vec::with_capacity(1024),
             file_fn: None,
             preview_highlight_handler: PreviewHighlightHandler::<T, D>::default().spawn(),
+            preview_media_handler: PreviewMediaHandler::<T, D>::default().spawn(),
             dynamic_query_handler: None,
         }
     }
@@ -603,6 +644,12 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                     if matches!(preview, CachedPreview::Document(doc) if doc.syntax().is_none()) {
                         helix_event::send_blocking(&self.preview_highlight_handler, path.clone());
                     }
+                    if matches!(
+                        preview,
+                        CachedPreview::Media(MediaPreview::Rendering { started: false, .. })
+                    ) {
+                        helix_event::send_blocking(&self.preview_media_handler, path.clone());
+                    }
                     return Some((Preview::Cached(preview), range));
                 }
 
@@ -628,6 +675,24 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                                 .collect();
                             Ok(CachedPreview::Directory(file_names))
                         } else if metadata.is_file() {
+                            // Images and PDFs are rendered graphically instead
+                            // of being read as text, so the size cap (which is
+                            // about loading a file into a rope) does not apply
+                            // to them.
+                            if let Some(kind) = helix_view::media::detect_kind(&path) {
+                                return Ok(CachedPreview::Media(
+                                    if editor.graphics.mode == GraphicsMode::None {
+                                        MediaPreview::Unavailable(
+                                            "<No image support in this terminal>".to_string(),
+                                        )
+                                    } else {
+                                        MediaPreview::Rendering {
+                                            kind,
+                                            started: false,
+                                        }
+                                    },
+                                ));
+                            }
                             if metadata.len() > MAX_FILE_SIZE_FOR_PREVIEW {
                                 return Ok(CachedPreview::LargeFile);
                             }
@@ -670,6 +735,12 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                         }
                     })
                     .unwrap_or(CachedPreview::NotFound);
+                if matches!(
+                    preview,
+                    CachedPreview::Media(MediaPreview::Rendering { started: false, .. })
+                ) {
+                    helix_event::send_blocking(&self.preview_media_handler, path.clone());
+                }
                 self.preview_cache.insert(path.clone(), preview);
                 Some((Preview::Cached(&self.preview_cache[&path]), range))
             }
@@ -897,6 +968,52 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         BLOCK.render(area, surface);
 
         if let Some((preview, range)) = self.get_preview(cx.editor) {
+            // Images and PDFs are drawn as a graphics placement rather than as
+            // text. Everything needed is copied out of the preview so that the
+            // borrow of the editor ends before its graphics state is touched.
+            let media = preview.media().map(|media| {
+                (
+                    media.raster.clone(),
+                    media.kind,
+                    media.page,
+                    media.page_count,
+                )
+            });
+            if let Some((raster, kind, page, page_count)) = media {
+                let caption = match kind {
+                    MediaKind::Pdf => match page_count {
+                        Some(count) => format!("page {}/{}", page + 1, count),
+                        None => format!("page {}", page + 1),
+                    },
+                    MediaKind::Image => format!("{}\u{00d7}{}", raster.width, raster.height),
+                };
+                // The last line is left for the caption.
+                let image_area = inner.clip_bottom(1);
+                let placement = ui::media::draw_raster(
+                    surface,
+                    &mut cx.editor.graphics,
+                    image_area,
+                    &raster,
+                    kind == MediaKind::Pdf,
+                );
+                let comment = cx.editor.theme.get("comment");
+                if let Some(placement) = placement {
+                    let x =
+                        inner.x + inner.width.saturating_sub(ui::media::text_width(&caption)) / 2;
+                    let y = placement.y + placement.height;
+                    surface.set_stringn(x, y, &caption, inner.width as usize, comment);
+                } else if cx.editor.graphics.mode == GraphicsMode::None {
+                    // A media document open in the editor can reach here with
+                    // graphics turned off; cached previews are marked
+                    // unavailable up front instead.
+                    let alt_text = "<No image support in this terminal>";
+                    let x = inner.x + inner.width.saturating_sub(alt_text.len() as u16) / 2;
+                    let y = inner.y + inner.height / 2;
+                    surface.set_stringn(x, y, alt_text, inner.width as usize, text);
+                }
+                return;
+            }
+
             let doc = match preview.document() {
                 Some(doc)
                     if range.is_none_or(|(start, end)| {
