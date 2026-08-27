@@ -5,6 +5,7 @@ mod extension;
 mod info;
 pub mod lsp;
 mod markdown;
+mod media;
 pub mod menu;
 pub mod overlay;
 pub mod picker;
