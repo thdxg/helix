@@ -1156,6 +1156,7 @@ fn load_configuration_api(engine: &mut Engine, generate_sources: bool) {
                     "bar" => CursorKind::Bar,
                     "underline" => CursorKind::Underline,
                     "hidden" => CursorKind::Hidden,
+                    "native" => CursorKind::Native,
                     _ => anyhow::bail!("Unable to match cursor kind from string: {}", shape),
                 };
 

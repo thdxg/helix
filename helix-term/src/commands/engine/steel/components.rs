@@ -1102,6 +1102,7 @@ impl Component for SteelDynamicComponent {
                                         "hidden" => CursorKind::Hidden,
                                         "bar" => CursorKind::Bar,
                                         "underline" => CursorKind::Underline,
+                                        "native" => CursorKind::Native,
                                         _ => CursorKind::Block,
                                     }
                                 }

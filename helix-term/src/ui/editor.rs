@@ -2007,7 +2007,9 @@ impl Component for EditorView {
             }
         }
         match editor.cursor() {
-            // all block cursors are drawn manually
+            // Block cursors are drawn manually as a highlight span, so the
+            // terminal cursor is hidden. Every other shape - including
+            // `Native` - is left to the terminal.
             (pos, CursorKind::Block) => {
                 if self.terminal_focused {
                     (pos, CursorKind::Hidden)
