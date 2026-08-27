@@ -9,7 +9,7 @@ use tokio::time::Instant;
 
 use crate::{job, ui::overlay::Overlay};
 
-use super::{CachedPreview, DynQueryCallback, Picker};
+use super::{CachedPreview, DynQueryCallback, MediaPreview, Picker};
 
 pub(super) struct PreviewHighlightHandler<T: 'static + Send + Sync, D: 'static + Send + Sync> {
     trigger: Option<Arc<Path>>,
@@ -106,6 +106,94 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> AsyncHook
                     );
                     doc.replace_diagnostics(diagnostics, &[], None);
                     doc.syntax = Some(syntax);
+                });
+            });
+        });
+    }
+}
+
+/// Rasterizes the image or PDF under the cursor so the preview can draw it.
+/// Debounced like [`PreviewHighlightHandler`]: scrolling past a directory of
+/// images should not shell out to `magick` for every one of them.
+pub(super) struct PreviewMediaHandler<T: 'static + Send + Sync, D: 'static + Send + Sync> {
+    trigger: Option<Arc<Path>>,
+    phantom_data: std::marker::PhantomData<(T, D)>,
+}
+
+impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Default for PreviewMediaHandler<T, D> {
+    fn default() -> Self {
+        Self {
+            trigger: None,
+            phantom_data: Default::default(),
+        }
+    }
+}
+
+impl<T: 'static + Send + Sync, D: 'static + Send + Sync> AsyncHook for PreviewMediaHandler<T, D> {
+    type Event = Arc<Path>;
+
+    fn handle_event(
+        &mut self,
+        path: Self::Event,
+        timeout: Option<tokio::time::Instant>,
+    ) -> Option<tokio::time::Instant> {
+        if self
+            .trigger
+            .as_ref()
+            .is_some_and(|trigger| trigger == &path)
+        {
+            // If the path hasn't changed, don't reset the debounce
+            timeout
+        } else {
+            self.trigger = Some(path);
+            Some(Instant::now() + Duration::from_millis(150))
+        }
+    }
+
+    fn finish_debounce(&mut self) {
+        let Some(path) = self.trigger.take() else {
+            return;
+        };
+
+        job::dispatch_blocking(move |_editor, compositor| {
+            let Some(Overlay {
+                content: picker, ..
+            }) = compositor.find::<Overlay<Picker<T, D>>>()
+            else {
+                return;
+            };
+
+            let Some(CachedPreview::Media(preview)) = picker.preview_cache.get_mut(&path) else {
+                return;
+            };
+            let MediaPreview::Rendering { kind, started } = preview else {
+                return;
+            };
+            if *started {
+                return;
+            }
+            *started = true;
+            let kind = *kind;
+
+            tokio::task::spawn_blocking(move || {
+                let media = helix_view::media::MediaState::open(kind, &path);
+
+                job::dispatch_blocking(move |_editor, compositor| {
+                    let Some(Overlay {
+                        content: picker, ..
+                    }) = compositor.find::<Overlay<Picker<T, D>>>()
+                    else {
+                        log::info!("picker closed before the preview finished rendering");
+                        return;
+                    };
+                    let Some(CachedPreview::Media(preview)) = picker.preview_cache.get_mut(&path)
+                    else {
+                        return;
+                    };
+                    *preview = match media {
+                        Ok(media) => MediaPreview::Ready(Box::new(media)),
+                        Err(err) => MediaPreview::Unavailable(format!("<{err}>")),
+                    };
                 });
             });
         });

@@ -7,6 +7,7 @@ use crate::{
     keymap::{KeymapResult, Keymaps},
     ui::{
         document::{render_document, LinePos, TextRenderer},
+        media::{draw_raster, text_width},
         statusline,
         text_decorations::{self, Decoration, DecorationManager, InlineDiagnostics},
         Completion, ProgressSpinners,
@@ -300,14 +301,6 @@ impl EditorView {
         });
     }
 
-    /// Display width of a caption, for centring it in a media view. Captions
-    /// contain non-ASCII characters (`\u{00d7}`, `\u{2014}`, `\u{2026}`), so
-    /// byte length would push them off centre.
-    fn text_width(text: &str) -> u16 {
-        use helix_core::unicode::width::UnicodeWidthStr;
-        text.width().try_into().unwrap_or(u16::MAX)
-    }
-
     /// Render a media document (image/PDF) as a kitty unicode-placeholder
     /// placement, or as an informational fallback when graphics are
     /// unavailable. See `helix_view::media`.
@@ -379,41 +372,19 @@ impl EditorView {
         };
 
         if inner.width > 0 && inner.height > 0 {
-            let total = surface.area;
-            let cell_px = editor.graphics.cell_px(total.width, total.height);
-            let (cols, rows) = media::fit_placement(
-                (raster.width, raster.height),
-                (inner.width, inner.height),
-                cell_px,
+            let placement = draw_raster(
+                surface,
+                &mut editor.graphics,
+                inner,
+                &raster,
                 kind == media::MediaKind::Pdf,
             );
 
-            if editor.graphics.ensure_placement(&raster, cols, rows) {
-                let x0 = inner.x + (inner.width - cols) / 2;
-                let y0 = inner.y + (inner.height - rows) / 2;
-                // The placeholder's foreground color carries the image id.
-                let id_style = Style::default().fg(Color::Rgb(
-                    (raster.id >> 16) as u8,
-                    (raster.id >> 8) as u8,
-                    raster.id as u8,
-                ));
-                let mut symbol = String::with_capacity(12);
-                for row in 0..rows {
-                    for col in 0..cols {
-                        let Some(chars) = media::placeholder_symbol(row, col) else {
-                            continue;
-                        };
-                        symbol.clear();
-                        symbol.extend(chars);
-                        surface[(x0 + col, y0 + row)]
-                            .set_symbol(&symbol)
-                            .set_style(id_style);
-                    }
-                }
+            if let Some(placement) = placement {
                 // Caption on the line below the image, if there is room.
-                let caption_y = y0 + rows;
+                let caption_y = placement.y + placement.height;
                 if caption_y < inner.y + inner.height {
-                    let x = inner.x + (inner.width.saturating_sub(Self::text_width(&caption))) / 2;
+                    let x = inner.x + (inner.width.saturating_sub(text_width(&caption))) / 2;
                     surface.set_string_truncated(
                         x,
                         caption_y,
@@ -443,7 +414,7 @@ impl EditorView {
                     if y >= inner.y + inner.height {
                         break;
                     }
-                    let x = inner.x + (inner.width.saturating_sub(Self::text_width(line))) / 2;
+                    let x = inner.x + (inner.width.saturating_sub(text_width(line))) / 2;
                     let style = if i < 2 { text_style } else { comment_style };
                     surface.set_string_truncated(
                         x,
