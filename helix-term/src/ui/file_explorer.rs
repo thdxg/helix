@@ -5,7 +5,11 @@ use std::{
 };
 
 use helix_core::hashmap;
-use helix_view::{theme::Style, Editor};
+use helix_view::{
+    editor::{ClipboardMode, ExplorerClipboard},
+    theme::Style,
+    Editor,
+};
 use tui::text::Span;
 
 use crate::{alt, compositor::Context, job::Callback, key};
@@ -537,6 +541,207 @@ pub(super) fn copy_selected(cx: &mut Context, op: FileOperation<'_>) {
     )
 }
 
+/// How a staged set of paths is named in the status line: the entry's own name
+/// when there is one of it, a count otherwise.
+fn staged_description(paths: &[PathBuf]) -> String {
+    match paths {
+        [path] => path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string()),
+        paths => format!("{} entries", paths.len()),
+    }
+}
+
+/// Shared implementation of [`cut_selected`] and [`copy_selected_to_clipboard`]:
+/// puts the selected entry on the editor's explorer clipboard, to be pasted by
+/// [`paste_clipboard`] into whichever directory the explorer is showing then.
+fn stage_on_clipboard(cx: &mut Context, op: FileOperation<'_>, mode: ClipboardMode) {
+    let FileOperation { path, root, .. } = op;
+
+    // Staging the `..` row, the root, or anything outside it is refused here so
+    // that a later paste can never be handed a path the explorer does not own.
+    if let Err(err) = check_within_root(&root, path) {
+        cx.editor.set_error(err);
+        return;
+    }
+
+    let paths = vec![helix_stdx::path::normalize(path)];
+    let description = staged_description(&paths);
+
+    cx.editor.explorer_clipboard = Some(ExplorerClipboard { paths, mode });
+    cx.editor.set_status(match mode {
+        ClipboardMode::Cut => format!("Cut {description}"),
+        ClipboardMode::Copy => format!("Copied {description}"),
+    });
+}
+
+/// Stages the selected entry to be moved by the next paste.
+pub(super) fn cut_selected(cx: &mut Context, op: FileOperation<'_>) {
+    stage_on_clipboard(cx, op, ClipboardMode::Cut)
+}
+
+/// Stages the selected entry to be duplicated by the next paste.
+pub(super) fn copy_selected_to_clipboard(cx: &mut Context, op: FileOperation<'_>) {
+    stage_on_clipboard(cx, op, ClipboardMode::Copy)
+}
+
+/// Works out where `source` lands when pasted into `root`, rejecting anything
+/// that would write outside the explorer or recurse for ever.
+fn paste_destination(root: &Path, source: &Path) -> Result<PathBuf, String> {
+    let Some(name) = source.file_name() else {
+        return Err(format!(
+            "{} has no file name to paste under",
+            source.display()
+        ));
+    };
+
+    let source = helix_stdx::path::normalize(source);
+    let destination = helix_stdx::path::normalize(root.join(name));
+
+    // A paste must land inside the directory the explorer is showing, the same
+    // guard the destructive operations use on their target.
+    check_within_root(root, &destination)?;
+
+    if destination == source {
+        return Err(format!(
+            "{} is already in {}",
+            name.to_string_lossy(),
+            root.display()
+        ));
+    }
+
+    // Pasting a directory into itself, or into one of its own descendants,
+    // would copy the copy for ever.
+    if destination.starts_with(&source) {
+        return Err(format!("Cannot paste {} into itself", source.display()));
+    }
+
+    Ok(destination)
+}
+
+/// Drops `source` from the clipboard once a paste has carried it out, clearing
+/// the clipboard entirely once nothing is left staged. See
+/// [`ExplorerClipboard::consume`].
+fn consume_pasted_entry(editor: &mut Editor, source: &Path) {
+    let Some(clipboard) = editor.explorer_clipboard.as_mut() else {
+        return;
+    };
+
+    if !clipboard.consume(source) {
+        editor.explorer_clipboard = None;
+    }
+}
+
+/// Carries out a single staged paste, once any overwrite has been confirmed.
+fn paste_entry(
+    cx: &mut Context,
+    root: PathBuf,
+    source: &Path,
+    destination: &Path,
+    mode: ClipboardMode,
+    cursor: u32,
+) -> OpResult {
+    // Checked again rather than trusting the check made when the paste started:
+    // a confirmation may have run in between, from a different layer.
+    if let Err(err) = check_within_root(&root, destination) {
+        return Some(Err(err));
+    }
+
+    // The entry may have been moved or deleted since it was staged.
+    if let Err(err) = fs::symlink_metadata(source) {
+        return Some(Err(format!("Unable to read {}: {err}", source.display())));
+    }
+
+    let outcome = match mode {
+        // `move_path` renames, tells the language servers about it and follows
+        // any open document to its new path. It falls back to a copy followed by
+        // a delete when the two paths are on different filesystems.
+        ClipboardMode::Cut => cx.editor.move_path(source, destination).map_err(|err| {
+            format!(
+                "Unable to move {} -> {}: {err}",
+                source.display(),
+                destination.display()
+            )
+        }),
+        // Recursive, so that pasting a directory brings its contents along.
+        ClipboardMode::Copy => helix_stdx::path::copy_all(source, destination).map_err(|err| {
+            format!(
+                "Unable to copy {} -> {}: {err}",
+                source.display(),
+                destination.display()
+            )
+        }),
+    };
+
+    if let Err(err) = outcome {
+        return Some(Err(err));
+    }
+
+    consume_pasted_entry(cx.editor, source);
+
+    let verb = match mode {
+        ClipboardMode::Cut => "Moved",
+        ClipboardMode::Copy => "Copied",
+    };
+
+    refresh_file_explorer(cursor, cx, root);
+
+    Some(Ok(format!(
+        "{verb} {} -> {}",
+        source.display(),
+        destination.display()
+    )))
+}
+
+/// Pastes whatever [`cut_selected`] or [`copy_selected_to_clipboard`] staged
+/// into the directory the explorer is showing.
+///
+/// The destination is the explorer's root rather than the entry under the
+/// cursor, matching how yazi's paste behaves. Overwriting an existing entry is
+/// confirmed first, and the confirmation defaults to "no".
+pub(super) fn paste_clipboard(cx: &mut Context, op: FileOperation<'_>) {
+    let FileOperation { root, cursor, .. } = op;
+
+    let Some(clipboard) = cx.editor.explorer_clipboard.clone() else {
+        cx.editor
+            .set_status("Nothing staged: cut or copy an entry before pasting");
+        return;
+    };
+
+    // Every destination is resolved and vetted before anything is written, so
+    // that a paste which cannot work leaves the filesystem untouched.
+    let mut entries = Vec::with_capacity(clipboard.paths.len());
+    for source in &clipboard.paths {
+        match paste_destination(&root, source) {
+            Ok(destination) => entries.push((source.clone(), destination)),
+            Err(err) => {
+                cx.editor.set_error(err);
+                return;
+            }
+        }
+    }
+
+    // One entry at a time. The clipboard only ever holds one today; once a
+    // multi-select fills it, several colliding entries would stack one
+    // confirmation prompt each.
+    for (source, destination) in entries {
+        let result = confirm_before_overwriting(
+            destination.clone(),
+            source,
+            cx,
+            root.clone(),
+            move |cx: &mut Context, root: PathBuf, source: &Path| {
+                paste_entry(cx, root, source, &destination, clipboard.mode, cursor)
+            },
+        );
+
+        if let Some(result) = result {
+            cx.editor.set_result(result);
+        }
+    }
+}
+
 /// Wraps one of the file operations above into a picker key handler.
 fn file_operation_key(operation: fn(&mut Context, FileOperation<'_>)) -> KeyHandler {
     Box::new(
@@ -621,18 +826,33 @@ pub fn file_explorer(
         alt!('x') => file_operation_key(delete_selected),
         alt!('c') => file_operation_key(copy_selected),
         alt!('y') => file_operation_key(yank_selected_path),
+        // The clipboard trio. `Alt-d` and `Alt-y`, which would have matched the
+        // bare keys below, are already spoken for — the prompt owns `Alt-d` and
+        // `Alt-y` yanks the selected path — so the cut and copy keys are
+        // `Alt-t` (take) and `Alt-w`, the latter after Emacs' `M-w` for copy.
+        alt!('t') => file_operation_key(cut_selected),
+        alt!('w') => file_operation_key(copy_selected_to_clipboard),
+        alt!('p') => file_operation_key(paste_clipboard),
     })
-    // The same operations on unmodified keys, live only in the normal mode of
-    // a modal picker (`editor.picker.modal`). `d` can be the delete key here
-    // because normal mode never types into the query, unlike `Alt-d`, which
-    // the prompt owns and which therefore stays spelled `Alt-x` above.
+    // A yazi-like layout on unmodified keys, live only in the normal mode of a
+    // modal picker (`editor.picker.modal`). Normal mode never types into the
+    // query, so plain letters are free here in a way they are not above.
+    //
+    // Unlike yazi, `d` cuts and `D` deletes: there is no trash to send an entry
+    // to, so the shifted key takes the unrecoverable operation. `c` is left
+    // unbound, reserved for a yazi-style `c`-prefixed family later on.
+    //
+    // `a` shadows one of the picker's three ways into insert mode; `i` and `/`
+    // still get to the query.
     .with_modal_key_handlers(hashmap! {
-        key!('n') => file_operation_key(create_file_or_directory),
-        key!('m') => file_operation_key(move_selected),
+        key!('a') => file_operation_key(create_file_or_directory),
         key!('r') => file_operation_key(rename_selected),
-        key!('d') => file_operation_key(delete_selected),
-        key!('c') => file_operation_key(copy_selected),
-        key!('y') => file_operation_key(yank_selected_path),
+        key!('m') => file_operation_key(move_selected),
+        key!('d') => file_operation_key(cut_selected),
+        key!('y') => file_operation_key(copy_selected_to_clipboard),
+        key!('p') => file_operation_key(paste_clipboard),
+        key!('D') => file_operation_key(delete_selected),
+        key!('Y') => file_operation_key(yank_selected_path),
     });
 
     Ok(picker)
@@ -676,6 +896,46 @@ mod test {
         assert_eq!(
             resolve_destination(anchor, "/tmp/lib.rs"),
             PathBuf::from("/tmp/lib.rs")
+        );
+    }
+
+    #[test]
+    fn test_paste_destination() {
+        let root = Path::new("/home/user/project");
+
+        // A paste lands under the directory the explorer is showing, keeping
+        // the staged entry's own name.
+        assert_eq!(
+            paste_destination(root, Path::new("/tmp/notes.md")),
+            Ok(PathBuf::from("/home/user/project/notes.md"))
+        );
+        assert_eq!(
+            paste_destination(root, Path::new("/tmp/src")),
+            Ok(PathBuf::from("/home/user/project/src"))
+        );
+
+        // Pasting an entry back into the directory it already lives in is a
+        // no-op at best and a self-overwrite at worst.
+        assert!(paste_destination(root, Path::new("/home/user/project/src")).is_err());
+
+        // Pasting a directory into itself or into one of its descendants would
+        // recurse for ever.
+        assert!(paste_destination(Path::new("/tmp/src"), Path::new("/tmp/src")).is_err());
+        assert!(paste_destination(Path::new("/tmp/src/nested"), Path::new("/tmp/src")).is_err());
+
+        // A staged path with no file name has nowhere to land.
+        assert!(paste_destination(root, Path::new("/")).is_err());
+    }
+
+    #[test]
+    fn test_staged_description() {
+        assert_eq!(
+            staged_description(&[PathBuf::from("/home/user/project/main.rs")]),
+            "main.rs"
+        );
+        assert_eq!(
+            staged_description(&[PathBuf::from("/a"), PathBuf::from("/b")]),
+            "2 entries"
         );
     }
 }

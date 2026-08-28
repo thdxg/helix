@@ -8,6 +8,7 @@ use ropey::RopeSlice;
 use std::{
     borrow::Cow,
     ffi::OsString,
+    fs,
     ops::Range,
     path::{Component, Path, PathBuf, MAIN_SEPARATOR_STR},
 };
@@ -300,6 +301,50 @@ pub fn expand<T: AsRef<Path> + ?Sized>(path: &T) -> Cow<'_, Path> {
     }
 }
 
+/// Copies `from` to `to`, recursing into directories.
+///
+/// [`std::fs::copy`] only handles single files, so a directory is recreated at
+/// `to` and every entry beneath it is copied in turn. Copying a directory onto
+/// an existing directory merges the two, and a file overwrites whatever is
+/// already at `to`, matching what `cp -r` does.
+///
+/// Entries are inspected with [`std::fs::symlink_metadata`] so that a symlink to
+/// a directory is treated as the single entry it is rather than recursed into.
+///
+/// The caller is responsible for making sure `to` is not inside `from`, which
+/// would recurse for ever.
+pub fn copy_all(from: &Path, to: &Path) -> std::io::Result<()> {
+    if !fs::symlink_metadata(from)?.is_dir() {
+        // A regular file, or a symlink, which `fs::copy` follows and copies the
+        // contents of. Copying the contents rather than recreating the link
+        // keeps the copy working even where the link's target does not resolve.
+        fs::copy(from, to)?;
+        return Ok(());
+    }
+
+    fs::create_dir_all(to)?;
+
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        copy_all(&entry.path(), &to.join(entry.file_name()))?;
+    }
+
+    Ok(())
+}
+
+/// Removes `path`, whether it is a file, a symlink or a whole directory tree.
+///
+/// [`std::fs::symlink_metadata`] is used rather than [`std::fs::metadata`] so
+/// that a symlink pointing at a directory is unlinked instead of being followed
+/// into the directory it names, which would delete the target's contents.
+pub fn remove_all(path: &Path) -> std::io::Result<()> {
+    if fs::symlink_metadata(path)?.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -452,5 +497,85 @@ mod tests {
             assert_match!(regex, "$FOO");
             assert_match!(regex, "${BAR}");
         }
+    }
+
+    #[test]
+    fn copy_all_recurses_into_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("from");
+        let to = dir.path().join("to");
+
+        std::fs::create_dir_all(from.join("nested/deeper")).unwrap();
+        std::fs::write(from.join("top.txt"), "top").unwrap();
+        std::fs::write(from.join("nested/deeper/leaf.txt"), "leaf").unwrap();
+
+        path::copy_all(&from, &to).unwrap();
+
+        // The original is untouched and the whole tree arrived at the copy.
+        assert_eq!(
+            std::fs::read_to_string(from.join("top.txt")).unwrap(),
+            "top"
+        );
+        assert_eq!(std::fs::read_to_string(to.join("top.txt")).unwrap(), "top");
+        assert_eq!(
+            std::fs::read_to_string(to.join("nested/deeper/leaf.txt")).unwrap(),
+            "leaf"
+        );
+    }
+
+    #[test]
+    fn copy_all_overwrites_a_file_and_merges_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("from");
+        let to = dir.path().join("to");
+
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::create_dir_all(&to).unwrap();
+        std::fs::write(from.join("shared.txt"), "new").unwrap();
+        std::fs::write(to.join("shared.txt"), "old").unwrap();
+        std::fs::write(to.join("kept.txt"), "kept").unwrap();
+
+        path::copy_all(&from, &to).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(to.join("shared.txt")).unwrap(),
+            "new"
+        );
+        assert_eq!(
+            std::fs::read_to_string(to.join("kept.txt")).unwrap(),
+            "kept"
+        );
+    }
+
+    #[test]
+    fn remove_all_unlinks_a_symlink_without_following_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("keep.txt"), "keep").unwrap();
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        #[cfg(windows)]
+        // Creating a symlink on Windows needs a privilege the test runner may
+        // not have; skip rather than fail the suite over it.
+        if std::os::windows::fs::symlink_dir(&target, &link).is_err() {
+            return;
+        }
+
+        path::remove_all(&link).unwrap();
+
+        // The link is gone, and what it pointed at is still there.
+        assert!(std::fs::symlink_metadata(&link).is_err());
+        assert_eq!(
+            std::fs::read_to_string(target.join("keep.txt")).unwrap(),
+            "keep"
+        );
+
+        // A whole tree still goes.
+        path::remove_all(&target).unwrap();
+        assert!(std::fs::symlink_metadata(&target).is_err());
     }
 }

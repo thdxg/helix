@@ -25,3 +25,7 @@ it always has. See the [modal picker keys](./keymap.md#modal-pickers).
 `Space-e` opens an interactive file explorer for browsing and opening files, rooted at the workspace; `Space-.` opens one rooted at the current buffer's directory. Unlike the file picker, the explorer does not ignore most files by default; its ignore behaviour is configured separately in the [`[editor.file-explorer]`](./editor.md#editorfile-explorer-section) section.
 
 The explorer can also act on the entry under the cursor: `Alt-n` creates a file or directory, `Alt-m` moves one, `Alt-r` renames one, `Alt-x` deletes one, `Alt-c` copies a file and `Alt-y` yanks a path to a register. Deleting, and overwriting an existing path with a move, rename or copy, always ask for confirmation first. See the [file explorer keys](./keymap.md#file-explorer) for the details.
+
+There is also a clipboard: `Alt-t` cuts the selected entry and `Alt-w` copies it, and `Alt-p` pastes whatever is staged into the directory the explorer is showing. Directories are pasted with everything in them. A cut is spent by the paste that carries it out, while a copy stays staged and can be pasted repeatedly. See the [file explorer clipboard](./keymap.md#file-explorer-clipboard).
+
+In a modal picker the explorer puts a yazi-like layout on unmodified keys — `a` create, `r` rename, `d` cut, `y` copy, `p` paste, `D` delete, `Y` yank path and `m` move. See the [modal file explorer keys](./keymap.md#file-explorer-modal-pickers).

@@ -21,6 +21,8 @@
 - [Picker](#picker)
   - [Modal pickers](#modal-pickers)
   - [File explorer](#file-explorer)
+    - [File explorer clipboard](#file-explorer-clipboard)
+    - [File explorer, modal pickers](#file-explorer-modal-pickers)
 - [Prompt](#prompt)
 
 > 💡 Mappings marked (**LSP**) require an active language server for the file.
@@ -540,10 +542,13 @@ They act on the entry under the cursor.
 | `Alt-x`                      | Delete the selected file or directory                      |
 | `Alt-c`                      | Copy the selected file                                     |
 | `Alt-y`                      | Yank the path of the selected file or directory            |
+| `Alt-t`                      | Cut the selected entry to the explorer clipboard           |
+| `Alt-w`                      | Copy the selected entry to the explorer clipboard          |
+| `Alt-p`                      | Paste the clipboard into the directory being shown         |
 
 Destructive operations always ask for confirmation first, and the confirmation
 defaults to "no": only a literal `y` goes ahead. This covers deleting an entry as
-well as overwriting an existing path with a move, rename or copy.
+well as overwriting an existing path with a move, rename, copy or paste.
 
 `Alt-m` prefills the prompt with the entry's full path, while `Alt-r` prefills
 just its name; both put the cursor before the file extension, since a rename
@@ -551,23 +556,48 @@ usually keeps it. A relative destination is resolved next to the entry the promp
 names, not against the working directory.
 
 `Alt-n` creates any missing intermediate directories. `Alt-c` does not support
-directories. `Alt-m`, `Alt-r` and `Alt-x` refuse to act on the `..` entry, and
-`Alt-x` will not delete anything outside the directory the explorer is showing.
+directories — use `Alt-w` and `Alt-p`, which copy recursively. `Alt-m`, `Alt-r`,
+`Alt-x`, `Alt-t` and `Alt-w` refuse to act on the `..` entry, and neither `Alt-x`
+nor `Alt-p` will touch anything outside the directory the explorer is showing.
 
-In the normal mode of a [modal picker](#modal-pickers) the same operations are
-also on unmodified keys. The `Alt` bindings above keep working in both modes.
+### File explorer clipboard
+
+`Alt-t` (cut) and `Alt-w` (copy) stage the selected entry, and `Alt-p` pastes it
+into the directory the explorer is currently showing, not into the entry under
+the cursor. A cut is spent by the paste that carries it out; a copy stays staged,
+so it can be pasted into several directories in a row.
+
+Pasting a directory brings its contents with it. If an entry of the same name is
+already there, the paste asks before overwriting, and pasting something into
+itself or into one of its own subdirectories is refused.
+
+The clipboard is separate from the register `Alt-y` yanks a path into, and it
+holds paths rather than file contents.
+
+### File explorer, modal pickers
+
+In the normal mode of a [modal picker](#modal-pickers) the explorer takes a
+yazi-like layout on unmodified keys. The `Alt` bindings above keep working in
+both modes.
 
 | Key                          | Description                                                |
 | -----                        | -------------                                              |
-| `n`                          | Create a new file, or a directory if the name ends with `/`|
-| `m`                          | Move the selected file or directory                        |
+| `a`                          | Create a new file, or a directory if the name ends with `/`|
 | `r`                          | Rename the selected file or directory                      |
-| `d`                          | Delete the selected file or directory                      |
-| `c`                          | Copy the selected file                                     |
-| `y`                          | Yank the path of the selected file or directory            |
+| `d`                          | Cut the selected entry to the explorer clipboard           |
+| `y`                          | Copy the selected entry to the explorer clipboard          |
+| `p`                          | Paste the clipboard into the directory being shown         |
+| `D`                          | Delete the selected file or directory                      |
+| `Y`                          | Yank the path of the selected file or directory            |
+| `m`                          | Move the selected file or directory to a typed destination |
 
-Delete is `d` here rather than `x`, since normal mode never types into the query
-and so does not have to avoid the `Alt-d` the prompt owns.
+Unlike yazi, `d` cuts and `D` deletes rather than `x` cutting and `d` trashing:
+there is no trash to send an entry to, so the shifted key takes the operation
+that cannot be undone. `m` is kept as an escape hatch for moving somewhere the
+clipboard cannot reach, and `c` is deliberately left unbound.
+
+`a` shadows one of the picker's three keys for entering insert mode; `i` and `/`
+still get you back to the query.
 
 ## Prompt
 
