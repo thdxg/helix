@@ -17,7 +17,7 @@ use crate::{alt, compositor::Context, job::Callback, key};
 use super::prompt::Movement;
 use super::{
     directory_content, overlay, picker,
-    picker::{PickerAction, PickerKeyHandler},
+    picker::{PickerAction, PickerKeyHandler, PickerMode, PickerModeHandle},
     Picker, PickerColumn, Prompt, PromptEvent,
 };
 
@@ -49,6 +49,9 @@ pub(super) struct FileOperation<'a> {
     /// Where the picker's cursor sits, so it can be restored once the explorer
     /// is reread.
     pub cursor: u32,
+    /// Which mode the picker is in, so that a user who is driving the explorer
+    /// from normal mode stays in normal mode once it is reread.
+    pub picker_mode: PickerMode,
 }
 
 /// Checks that `path` is an entry inside `root` that destructive operations may
@@ -200,15 +203,16 @@ fn create_file_operation_prompt<F>(
 }
 
 /// Rereads `root` and replaces the open explorer with the result, so that a
-/// completed file operation becomes visible. The cursor is restored to `cursor`.
-fn refresh_file_explorer(cursor: u32, cx: &mut Context, root: PathBuf) {
+/// completed file operation becomes visible. The cursor is restored to `cursor`
+/// and the picker reopens in `mode`.
+fn refresh_file_explorer(cursor: u32, picker_mode: PickerMode, cx: &mut Context, root: PathBuf) {
     let callback = Box::pin(async move {
         let call: Callback = Callback::EditorCompositor(Box::new(move |editor, compositor| {
             // Replace the old file explorer with a new one. `remove` is used
             // rather than `pop` so that only the picker is ever removed;
             // `Overlay` forwards the picker's id.
             compositor.remove(picker::ID);
-            if let Ok(picker) = file_explorer(Some(cursor), root, editor) {
+            if let Ok(picker) = file_explorer_with_mode(Some(cursor), picker_mode, root, editor) {
                 compositor.push(Box::new(overlay::overlaid(picker)));
             }
         }));
@@ -246,7 +250,12 @@ pub(super) fn yank_selected_path(cx: &mut Context, op: FileOperation<'_>) {
 ///
 /// Asks for confirmation before overwriting an existing path.
 pub(super) fn create_file_or_directory(cx: &mut Context, op: FileOperation<'_>) {
-    let FileOperation { path, root, cursor } = op;
+    let FileOperation {
+        path,
+        root,
+        cursor,
+        picker_mode,
+    } = op;
 
     create_file_operation_prompt(
         cx,
@@ -276,7 +285,7 @@ pub(super) fn create_file_or_directory(cx: &mut Context, op: FileOperation<'_>) 
                             )));
                         }
 
-                        refresh_file_explorer(cursor, cx, root);
+                        refresh_file_explorer(cursor, picker_mode, cx, root);
 
                         return Some(Ok(format!("Created directory: {}", to_create.display())));
                     }
@@ -303,7 +312,7 @@ pub(super) fn create_file_or_directory(cx: &mut Context, op: FileOperation<'_>) 
                         )));
                     }
 
-                    refresh_file_explorer(cursor, cx, root);
+                    refresh_file_explorer(cursor, picker_mode, cx, root);
 
                     Some(Ok(format!("Created file: {}", to_create.display())))
                 },
@@ -322,7 +331,12 @@ fn move_selected_with(
     prompt: fn(&Path) -> String,
     prefill: fn(&Path) -> String,
 ) {
-    let FileOperation { path, root, cursor } = op;
+    let FileOperation {
+        path,
+        root,
+        cursor,
+        picker_mode,
+    } = op;
 
     if let Err(err) = check_within_root(&root, path) {
         cx.editor.set_error(err);
@@ -360,7 +374,7 @@ fn move_selected_with(
                         )));
                     }
 
-                    refresh_file_explorer(cursor, cx, root);
+                    refresh_file_explorer(cursor, picker_mode, cx, root);
 
                     Some(Ok(format!(
                         "Moved {} -> {}",
@@ -409,7 +423,12 @@ pub(super) fn rename_selected(cx: &mut Context, op: FileOperation<'_>) {
 ///
 /// Always asks for confirmation first, and the confirmation defaults to "no".
 pub(super) fn delete_selected(cx: &mut Context, op: FileOperation<'_>) {
-    let FileOperation { path, root, cursor } = op;
+    let FileOperation {
+        path,
+        root,
+        cursor,
+        picker_mode,
+    } = op;
 
     if let Err(err) = check_within_root(&root, path) {
         cx.editor.set_error(err);
@@ -463,7 +482,7 @@ pub(super) fn delete_selected(cx: &mut Context, op: FileOperation<'_>) {
                     )));
                 }
 
-                refresh_file_explorer(cursor, cx, root);
+                refresh_file_explorer(cursor, picker_mode, cx, root);
 
                 return Some(Ok(format!("Deleted directory: {}", to_delete.display())));
             }
@@ -475,7 +494,7 @@ pub(super) fn delete_selected(cx: &mut Context, op: FileOperation<'_>) {
                 )));
             }
 
-            refresh_file_explorer(cursor, cx, root);
+            refresh_file_explorer(cursor, picker_mode, cx, root);
 
             Some(Ok(format!("Deleted file: {}", to_delete.display())))
         },
@@ -486,7 +505,12 @@ pub(super) fn delete_selected(cx: &mut Context, op: FileOperation<'_>) {
 ///
 /// Asks for confirmation before overwriting an existing path.
 pub(super) fn copy_selected(cx: &mut Context, op: FileOperation<'_>) {
-    let FileOperation { path, root, cursor } = op;
+    let FileOperation {
+        path,
+        root,
+        cursor,
+        picker_mode,
+    } = op;
 
     create_file_operation_prompt(
         cx,
@@ -528,7 +552,7 @@ pub(super) fn copy_selected(cx: &mut Context, op: FileOperation<'_>) {
                         )));
                     }
 
-                    refresh_file_explorer(cursor, cx, picker_root);
+                    refresh_file_explorer(cursor, picker_mode, cx, picker_root);
 
                     Some(Ok(format!(
                         "Copied contents of file {} to {}",
@@ -641,6 +665,7 @@ fn paste_entry(
     destination: &Path,
     mode: ClipboardMode,
     cursor: u32,
+    picker_mode: PickerMode,
 ) -> OpResult {
     // Checked again rather than trusting the check made when the paste started:
     // a confirmation may have run in between, from a different layer.
@@ -685,7 +710,7 @@ fn paste_entry(
         ClipboardMode::Copy => "Copied",
     };
 
-    refresh_file_explorer(cursor, cx, root);
+    refresh_file_explorer(cursor, picker_mode, cx, root);
 
     Some(Ok(format!(
         "{verb} {} -> {}",
@@ -701,7 +726,12 @@ fn paste_entry(
 /// cursor, matching how yazi's paste behaves. Overwriting an existing entry is
 /// confirmed first, and the confirmation defaults to "no".
 pub(super) fn paste_clipboard(cx: &mut Context, op: FileOperation<'_>) {
-    let FileOperation { root, cursor, .. } = op;
+    let FileOperation {
+        root,
+        cursor,
+        picker_mode,
+        ..
+    } = op;
 
     let Some(clipboard) = cx.editor.explorer_clipboard.clone() else {
         cx.editor
@@ -732,7 +762,15 @@ pub(super) fn paste_clipboard(cx: &mut Context, op: FileOperation<'_>) {
             cx,
             root.clone(),
             move |cx: &mut Context, root: PathBuf, source: &Path| {
-                paste_entry(cx, root, source, &destination, clipboard.mode, cursor)
+                paste_entry(
+                    cx,
+                    root,
+                    source,
+                    &destination,
+                    clipboard.mode,
+                    cursor,
+                    picker_mode,
+                )
             },
         );
 
@@ -753,6 +791,7 @@ fn file_operation_key(operation: fn(&mut Context, FileOperation<'_>)) -> KeyHand
                     path,
                     root: args.data.0.clone(),
                     cursor: args.cursor,
+                    picker_mode: args.mode,
                 },
             )
         },
@@ -765,6 +804,23 @@ fn file_operation_key(operation: fn(&mut Context, FileOperation<'_>)) -> KeyHand
 /// is reopened after a file operation.
 pub fn file_explorer(
     cursor: Option<u32>,
+    root: PathBuf,
+    editor: &Editor,
+) -> Result<FileExplorer, std::io::Error> {
+    file_explorer_with_mode(cursor, PickerMode::default(), root, editor)
+}
+
+/// As [`file_explorer`], but opening in `mode`.
+///
+/// The explorer does not update itself in place: a file operation and a descent
+/// into a subdirectory both throw the picker away and build a fresh one. Left to
+/// itself the replacement would open in [`PickerMode::Insert`] like any other
+/// picker, dropping a user who was driving the explorer with bare keys back into
+/// the query without having asked to be — so the mode is carried across the
+/// rebuild.
+fn file_explorer_with_mode(
+    cursor: Option<u32>,
+    mode: PickerMode,
     root: PathBuf,
     editor: &Editor,
 ) -> Result<FileExplorer, std::io::Error> {
@@ -789,6 +845,12 @@ pub fn file_explorer(
         },
     )];
 
+    // Shared with the picker below, so that descending into a directory can read
+    // the mode the user is in at the moment they press Enter — which is not
+    // necessarily `mode`, since `Esc` and `i` move between modes in between.
+    let mode = PickerModeHandle::new(mode);
+    let descend_mode = mode.clone();
+
     let picker = Picker::new(
         columns,
         0,
@@ -797,10 +859,13 @@ pub fn file_explorer(
         move |cx, (path, is_dir): &ExplorerItem, action| {
             if *is_dir {
                 let new_root = helix_stdx::path::normalize(path);
+                let mode = descend_mode.get();
                 let callback = Box::pin(async move {
                     let call: Callback =
                         Callback::EditorCompositor(Box::new(move |editor, compositor| {
-                            if let Ok(picker) = file_explorer(None, new_root, editor) {
+                            if let Ok(picker) =
+                                file_explorer_with_mode(None, mode, new_root, editor)
+                            {
                                 compositor.push(Box::new(overlay::overlaid(picker)));
                             }
                         }));
@@ -818,6 +883,7 @@ pub fn file_explorer(
         },
     )
     .with_initial_cursor(cursor)
+    .with_mode_handle(mode)
     .with_preview(|_editor, (path, _is_dir)| Some((path.as_path().into(), None)))
     .with_key_handlers(hashmap! {
         alt!('n') => file_operation_key(create_file_or_directory),
