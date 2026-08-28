@@ -238,7 +238,7 @@ fn open_file_explorer(
             // rather than `pop` so that only the picker is ever removed;
             // `Overlay` forwards the picker's id.
             compositor.remove(picker::ID);
-            if let Ok(picker) = file_explorer_with_mode(cursor, picker_mode, root, editor) {
+            if let Ok(picker) = file_explorer_with_mode(cursor, Some(picker_mode), root, editor) {
                 compositor.push(Box::new(overlay::overlaid(picker)));
             }
         }));
@@ -889,26 +889,27 @@ pub fn file_explorer(
 ) -> Result<FileExplorer, std::io::Error> {
     file_explorer_with_mode(
         ExplorerCursor::Row(cursor.unwrap_or_default()),
-        PickerMode::default(),
+        None,
         root,
         editor,
     )
 }
 
-/// As [`file_explorer`], but opening in `mode`.
+/// As [`file_explorer`], but opening in `mode`, or in the configured default
+/// mode when that is `None`.
 ///
 /// The explorer does not update itself in place: a file operation and a descent
 /// into a subdirectory both throw the picker away and build a fresh one. Left to
-/// itself the replacement would open in [`PickerMode::Insert`] like any other
-/// picker, dropping a user who was driving the explorer with bare keys back into
-/// the query without having asked to be — so the mode is carried across the
-/// rebuild.
+/// itself the replacement would open in the default mode again, dropping a user
+/// who had left it back where they started without having asked to be — so the
+/// mode is carried across the rebuild.
 fn file_explorer_with_mode(
     cursor: ExplorerCursor,
-    mode: PickerMode,
+    mode: Option<PickerMode>,
     root: PathBuf,
     editor: &Editor,
 ) -> Result<FileExplorer, std::io::Error> {
+    let mode = mode.unwrap_or_else(|| editor.config().file_explorer.default_mode.into());
     let directory_style = editor.theme.get("ui.text.directory");
     let directory_content = directory_content(&root, editor)?;
 

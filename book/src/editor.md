@@ -257,6 +257,7 @@ Note that the ignore files consulted by the file explorer when `ignore` is set t
 |`git-global` | Enables reading global `.gitignore`, whose path is specified in git's config: `core.excludesfile` option | `false`
 |`git-exclude` | Enables reading `.git/info/exclude` files | `false`
 |`flatten-dirs` | Enables flattening single child directories | `true`
+|`default-mode` | Which mode the file explorer opens in, `insert` or `normal`, when `editor.picker.modal` is enabled | `normal`
 
 ### `[editor.buffer-picker]` Section
 
@@ -280,6 +281,7 @@ Behaviour shared by every picker.
 | Key | Description | Default |
 |--|--|---------|
 |`modal` | Enables modal editing inside pickers, so that picker actions can be reached with unmodified keys instead of modifier chords | `false` |
+|`default-mode` | Which mode a picker opens in, `insert` or `normal`, when `modal` is enabled | `insert` |
 
 Example
 
@@ -288,15 +290,27 @@ Example
 modal = true
 ```
 
-A picker always opens in insert mode, where every key types into the query as
-usual. With `modal = true`, <kbd>Esc</kbd> leaves the query for normal mode
-instead of closing the picker; there, unmodified keys drive the picker and
-<kbd>q</kbd> or a second <kbd>Esc</kbd> closes it. See [the picker keymap] for
-the full list of normal-mode keys.
+With `modal = true`, <kbd>Esc</kbd> leaves the query for normal mode instead of
+closing the picker; there, unmodified keys drive the picker and <kbd>q</kbd> or a
+second <kbd>Esc</kbd> closes it. See [the picker keymap] for the full list of
+normal-mode keys.
 
-With `modal = false`, the default, pickers behave exactly as they always have:
-<kbd>Esc</kbd> closes the picker and there is no normal mode to enter. The
-`Ctrl` bindings work the same either way.
+Pickers open in insert mode, where every key types into the query as usual. The
+file explorer is the exception: it is driven with bare keys far more often than
+it is filtered by name, so it opens in normal mode. Either default can be
+changed:
+
+```toml
+[editor.picker]
+default-mode = "normal"   # every picker opens in normal mode
+
+[editor.file-explorer]
+default-mode = "insert"   # ...except the file explorer
+```
+
+Both are ignored while `modal = false`, the default, in which case pickers behave
+exactly as they always have: <kbd>Esc</kbd> closes the picker and there is no
+normal mode to enter. The `Ctrl` bindings work the same either way.
 
 [the picker keymap]: ./keymap.md#picker
 

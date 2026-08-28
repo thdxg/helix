@@ -48,7 +48,7 @@ use helix_core::{
     visual_offset_from_anchor, Position,
 };
 use helix_view::{
-    editor::Action,
+    editor::{Action, PickerModeConfig},
     graphics::{CursorKind, Margin, Modifier, Rect},
     input::KeyEvent,
     media::{GraphicsMode, MediaKind, MediaState},
@@ -67,13 +67,24 @@ pub const ID: &str = "picker";
 /// Which mode a picker's key handling is in, when `editor.picker.modal` is
 /// enabled. Modal handling is skipped entirely while it is disabled, so the
 /// mode is only ever consulted for a modal picker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Deliberately not [`Default`]: which mode a picker opens in is the
+/// configuration's to say. See [`Picker::mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerMode {
     /// Keys type into the query, as they always do in a non-modal picker.
-    #[default]
     Insert,
     /// Unmodified keys drive the picker instead of typing into the query.
     Normal,
+}
+
+impl From<PickerModeConfig> for PickerMode {
+    fn from(mode: PickerModeConfig) -> Self {
+        match mode {
+            PickerModeConfig::Insert => Self::Insert,
+            PickerModeConfig::Normal => Self::Normal,
+        }
+    }
 }
 
 /// A live view of a picker's [`PickerMode`], shared between the picker and
@@ -85,22 +96,28 @@ pub enum PickerMode {
 /// user is in *now*, which is not necessarily the mode the picker was built in.
 /// A callback holding a clone of this handle can read that mode at the moment
 /// its key is pressed and pass it on. See [`Picker::with_mode_handle`].
+///
+/// A handle starts out empty when nobody named a mode for the picker to open in,
+/// in which case the picker takes the configured default the first time it is
+/// asked which mode it is in: [`Picker::new`] has no editor to read the
+/// configuration from.
 #[derive(Debug, Clone, Default)]
-pub struct PickerModeHandle(Rc<std::cell::Cell<PickerMode>>);
+pub struct PickerModeHandle(Rc<std::cell::Cell<Option<PickerMode>>>);
 
 impl PickerModeHandle {
     /// A handle on a picker which is to open in `mode`.
     pub fn new(mode: PickerMode) -> Self {
-        Self(Rc::new(std::cell::Cell::new(mode)))
+        Self(Rc::new(std::cell::Cell::new(Some(mode))))
     }
 
-    /// The mode the picker is in right now.
-    pub fn get(&self) -> PickerMode {
+    /// The mode the picker is in right now, or `None` for a picker which has
+    /// not been told which mode to open in and has not opened yet.
+    pub fn get(&self) -> Option<PickerMode> {
         self.0.get()
     }
 
     fn set(&self, mode: PickerMode) {
-        self.0.set(mode);
+        self.0.set(Some(mode));
     }
 }
 
@@ -405,9 +422,9 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     /// See [`Picker::with_modal_key_handlers`].
     modal_key_handlers: PickerKeyHandlers<T, D>,
     /// The picker's modal-editing mode. Only consulted when
-    /// `editor.picker.modal` is enabled; a picker opens in
-    /// [`PickerMode::Insert`] so that typing filters right away, unless its
-    /// creator hands it a [`PickerModeHandle`] saying otherwise.
+    /// `editor.picker.modal` is enabled; a picker opens in the mode
+    /// `editor.picker.default-mode` names, unless its creator hands it a
+    /// [`PickerModeHandle`] saying otherwise. Read through [`Picker::mode`].
     mode: PickerModeHandle,
 
     pub truncate_start: bool,
@@ -610,8 +627,8 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     }
 
     /// Opens the picker in the mode `handle` currently names, rather than the
-    /// [`PickerMode::Insert`] a picker opens in by default, and keeps `handle`
-    /// in sync with the picker's mode for as long as the picker lives.
+    /// configured default, and keeps `handle` in sync with the picker's mode for
+    /// as long as the picker lives.
     ///
     /// Only pickers that rebuild themselves need this; see
     /// [`PickerModeHandle`]. A picker that merely wants to reopen where the
@@ -702,11 +719,23 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 selection,
                 data: Arc::clone(&self.editor_data),
                 cursor: self.cursor,
-                mode: self.mode.get(),
+                mode: self.mode(cx.editor),
             },
         );
 
         true
+    }
+
+    /// The mode the picker is in, resolving `editor.picker.default-mode` the
+    /// first time it is asked for. A picker built without a mode of its own has
+    /// none until then: [`Picker::new`] has no editor to read the configuration
+    /// from.
+    fn mode(&self, editor: &Editor) -> PickerMode {
+        self.mode.get().unwrap_or_else(|| {
+            let mode = editor.config().picker.default_mode.into();
+            self.mode.set(mode);
+            mode
+        })
     }
 
     /// Whether the picker is currently in modal normal mode, where unmodified
@@ -716,7 +745,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     /// default: turning the option off restores exactly the pre-modal
     /// behaviour, `Esc` closing the picker included.
     fn in_normal_mode(&self, editor: &Editor) -> bool {
-        editor.config().picker.modal && self.mode.get() == PickerMode::Normal
+        editor.config().picker.modal && self.mode(editor) == PickerMode::Normal
     }
 
     pub fn with_dynamic_query(
@@ -1180,7 +1209,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             .config()
             .picker
             .modal
-            .then(|| match self.mode.get() {
+            .then(|| match self.mode(cx.editor) {
                 PickerMode::Insert => ("INS ", cx.editor.theme.get("ui.statusline.insert")),
                 PickerMode::Normal => ("NOR ", cx.editor.theme.get("ui.statusline.normal")),
             });
@@ -1801,7 +1830,7 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             let mut key_event = key_event;
             editor::canonicalize_key(&mut key_event);
 
-            match self.mode.get() {
+            match self.mode(ctx.editor) {
                 PickerMode::Insert => {
                     if key_event == key!(Esc) {
                         self.mode.set(PickerMode::Normal);
@@ -2153,16 +2182,23 @@ mod modal_test {
     }
 
     #[tokio::test]
-    async fn a_picker_opens_in_insert_mode() {
-        assert_eq!(PickerMode::default(), PickerMode::Insert);
-        assert_eq!(test_picker().mode.get(), PickerMode::Insert);
+    async fn a_picker_opens_in_the_configured_default_mode() {
+        // A picker built without a mode of its own has none to report until an
+        // editor is at hand to read `editor.picker.default-mode` from, which
+        // names insert mode unless the user says otherwise.
+        assert_eq!(test_picker().mode.get(), None);
+        assert_eq!(PickerModeConfig::default(), PickerModeConfig::Insert);
+        assert_eq!(
+            PickerMode::from(PickerModeConfig::default()),
+            PickerMode::Insert
+        );
     }
 
     #[tokio::test]
     async fn a_picker_opens_in_the_mode_its_handle_names() {
         let picker = test_picker().with_mode_handle(PickerModeHandle::new(PickerMode::Normal));
 
-        assert_eq!(picker.mode.get(), PickerMode::Normal);
+        assert_eq!(picker.mode.get(), Some(PickerMode::Normal));
     }
 
     #[tokio::test]
@@ -2175,9 +2211,9 @@ mod modal_test {
         let picker = test_picker().with_mode_handle(handle.clone());
 
         picker.mode.set(PickerMode::Normal);
-        assert_eq!(handle.get(), PickerMode::Normal);
+        assert_eq!(handle.get(), Some(PickerMode::Normal));
 
         picker.mode.set(PickerMode::Insert);
-        assert_eq!(handle.get(), PickerMode::Insert);
+        assert_eq!(handle.get(), Some(PickerMode::Insert));
     }
 }
