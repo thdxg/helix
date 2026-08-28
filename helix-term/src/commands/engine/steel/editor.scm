@@ -106,7 +106,9 @@
 (provide set-file-picker-open-handler!)
 ;;@doc
 ;; Install a handler that gets the chance to open files selected in the file
-;; picker before the default open path runs. The handler is called with two
+;; picker or the file explorer before the default open path runs. The handler
+;; is not consulted for a directory row in the explorer, which descends into
+;; the directory instead of opening anything. The handler is called with two
 ;; arguments: the selected path as a string, and the requested action as one
 ;; of the symbols 'replace (enter), 'vsplit (ctrl-v), 'hsplit (ctrl-s) or
 ;; 'load. Return `#f` to fall back to the default behavior for that action;

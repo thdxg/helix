@@ -460,8 +460,8 @@ struct FilePickerOpenHandler {
 }
 
 /// A steel function that gets the chance to handle opening a path from the
-/// file picker before the default `Editor::open` path runs. See
-/// [`dispatch_file_picker_open_handler`].
+/// file picker or the file explorer before the default `Editor::open` path
+/// runs. See [`dispatch_file_picker_open_handler`].
 static FILE_PICKER_OPEN_HANDLER: Lazy<RwLock<Option<FilePickerOpenHandler>>> =
     Lazy::new(|| RwLock::new(None));
 
@@ -482,9 +482,9 @@ fn set_file_picker_open_handler(callback_fn: SteelVal) {
 }
 
 /// Give a registered steel handler the chance to handle opening a path from
-/// the file picker. Returns `true` when the handler consumed the open, i.e.
-/// it returned anything other than `#f`; the caller should then skip the
-/// default `Editor::open`.
+/// the file picker or the file explorer. Returns `true` when the handler
+/// consumed the open, i.e. it returned anything other than `#f`; the caller
+/// should then skip the default `Editor::open`.
 pub fn dispatch_file_picker_open_handler(
     cx: &mut compositor::Context,
     path: &std::path::Path,
