@@ -1647,6 +1647,16 @@ impl Editor {
         self.status_msg = Some((error, Severity::Error));
     }
 
+    /// Sets the status line from the outcome of an operation: `Ok` becomes an
+    /// info status, `Err` an error status.
+    #[inline]
+    pub fn set_result<T: Into<Cow<'static, str>>>(&mut self, result: Result<T, T>) {
+        match result {
+            Ok(ok) => self.set_status(ok),
+            Err(err) => self.set_error(err),
+        }
+    }
+
     #[inline]
     pub fn set_warning<T: Into<Cow<'static, str>>>(&mut self, warning: T) {
         let warning = warning.into();

@@ -489,6 +489,33 @@ See the documentation page on [pickers](./pickers.md) for more info.
 
 > 💡 The preview scroll keys act on whatever the preview shows: a file scrolls by visual lines, so soft-wrapped lines can be read to the end; a PDF turns one page per press; and an image taller than the preview pane is fitted to its width and panned vertically.
 
+### File explorer
+
+These extra keys are available in the file explorer (`Space-e` and `Space-.`).
+They act on the entry under the cursor.
+
+| Key                          | Description                                                |
+| -----                        | -------------                                              |
+| `Alt-n`                      | Create a new file, or a directory if the name ends with `/`|
+| `Alt-m`                      | Move the selected file or directory                        |
+| `Alt-r`                      | Rename the selected file or directory                      |
+| `Alt-x`                      | Delete the selected file or directory                      |
+| `Alt-c`                      | Copy the selected file                                     |
+| `Alt-y`                      | Yank the path of the selected file or directory            |
+
+Destructive operations always ask for confirmation first, and the confirmation
+defaults to "no": only a literal `y` goes ahead. This covers deleting an entry as
+well as overwriting an existing path with a move, rename or copy.
+
+`Alt-m` prefills the prompt with the entry's full path, while `Alt-r` prefills
+just its name; both put the cursor before the file extension, since a rename
+usually keeps it. A relative destination is resolved next to the entry the prompt
+names, not against the working directory.
+
+`Alt-n` creates any missing intermediate directories. `Alt-c` does not support
+directories. `Alt-m`, `Alt-r` and `Alt-x` refuse to act on the `..` entry, and
+`Alt-x` will not delete anything outside the directory the explorer is showing.
+
 ## Prompt
 
 Keys to use within prompt, Remapping currently not supported.
