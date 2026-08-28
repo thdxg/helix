@@ -116,6 +116,7 @@ enum NormalModeAction {
     ScrollPreviewPageDown,
     ScrollPreviewPageUp,
     TogglePreview,
+    Open,
     OpenVerticalSplit,
     OpenHorizontalSplit,
     EnterInsertMode,
@@ -143,6 +144,10 @@ fn normal_mode_action(event: KeyEvent) -> Option<NormalModeAction> {
         key!('f') => NormalModeAction::ScrollPreviewPageDown,
         key!('b') => NormalModeAction::ScrollPreviewPageUp,
         key!('t') => NormalModeAction::TogglePreview,
+        // `l` opens the selection just as `Enter` does. In the file explorer
+        // that means descending into the directory under the cursor, the other
+        // half of the `h`/`l` tree navigation it borrows from yazi.
+        key!('l') => NormalModeAction::Open,
         key!('v') => NormalModeAction::OpenVerticalSplit,
         key!('s') => NormalModeAction::OpenHorizontalSplit,
         key!('i') | key!('a') | key!('/') => NormalModeAction::EnterInsertMode,
@@ -1836,6 +1841,12 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
                     if let Some(action) = action {
                         match action {
                             NormalModeAction::Close => return close_fn(self),
+                            NormalModeAction::Open => {
+                                if let Some(option) = self.selection() {
+                                    (self.callback_fn)(ctx, option, self.default_action);
+                                }
+                                return close_fn(self);
+                            }
                             NormalModeAction::OpenVerticalSplit => {
                                 if let Some(option) = self.selection() {
                                     (self.callback_fn)(ctx, option, Action::VerticalSplit);
@@ -2080,6 +2091,7 @@ mod modal_test {
         assert_eq!(action("f"), Some(NormalModeAction::ScrollPreviewPageDown));
         assert_eq!(action("b"), Some(NormalModeAction::ScrollPreviewPageUp));
         assert_eq!(action("t"), Some(NormalModeAction::TogglePreview));
+        assert_eq!(action("l"), Some(NormalModeAction::Open));
         assert_eq!(action("v"), Some(NormalModeAction::OpenVerticalSplit));
         assert_eq!(action("s"), Some(NormalModeAction::OpenHorizontalSplit));
         assert_eq!(action("q"), Some(NormalModeAction::Close));
@@ -2124,7 +2136,7 @@ mod modal_test {
         // `with_modal_key_handlers`, which is consulted before the keymap
         // above; if one were also a built-in normal-mode key the binding would
         // be unreachable.
-        for key in ["m", "r", "d", "y", "p", "D", "Y"] {
+        for key in ["m", "r", "d", "y", "p", "D", "Y", "h"] {
             assert_eq!(action(key), None, "{key} is claimed twice");
         }
 
