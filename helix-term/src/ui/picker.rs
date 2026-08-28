@@ -2071,9 +2071,16 @@ mod modal_test {
         // `with_modal_key_handlers`, which is consulted before the keymap
         // above; if one were also a built-in normal-mode key the binding would
         // be unreachable.
-        for key in ["n", "m", "r", "d", "c", "y"] {
+        for key in ["m", "r", "d", "y", "p", "D", "Y"] {
             assert_eq!(action(key), None, "{key} is claimed twice");
         }
+
+        // `a` is the deliberate exception: the explorer binds it to "create", a
+        // yazi habit, and so shadows one of the three keys that enter insert
+        // mode. The other two still reach the query.
+        assert_eq!(action("a"), Some(NormalModeAction::EnterInsertMode));
+        assert_eq!(action("i"), Some(NormalModeAction::EnterInsertMode));
+        assert_eq!(action("/"), Some(NormalModeAction::EnterInsertMode));
     }
 
     #[test]
