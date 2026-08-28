@@ -250,6 +250,10 @@ pub struct FileExplorerConfig {
     pub git_exclude: bool,
     /// Whether to flatten single-child directories in file explorer. Defaults to true.
     pub flatten_dirs: bool,
+    /// Which mode the file explorer opens in, when `editor.picker.modal` is
+    /// enabled. Defaults to `normal`: the explorer is driven with bare keys
+    /// much more often than it is filtered by name.
+    pub default_mode: PickerModeConfig,
 }
 
 impl Default for FileExplorerConfig {
@@ -263,6 +267,7 @@ impl Default for FileExplorerConfig {
             git_global: false,
             git_exclude: false,
             flatten_dirs: true,
+            default_mode: PickerModeConfig::Normal,
         }
     }
 }
@@ -544,6 +549,23 @@ pub struct PickerConfig {
     /// into the query. Defaults to `false`, in which case `Esc` closes the
     /// picker as it always has.
     pub modal: bool,
+    /// Which mode a picker opens in, when `modal` is enabled. Defaults to
+    /// `insert`, so that typing filters right away. The file explorer has its
+    /// own default under `editor.file-explorer.default-mode`.
+    pub default_mode: PickerModeConfig,
+}
+
+/// Which mode a picker opens in, when `editor.picker.modal` is enabled. Ignored
+/// entirely while it is disabled: a non-modal picker has no normal mode to be
+/// in.
+#[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, Clone, Copy)]
+#[serde(rename_all = "kebab-case")]
+pub enum PickerModeConfig {
+    /// Keys type into the query.
+    #[default]
+    Insert,
+    /// Unmodified keys drive the picker.
+    Normal,
 }
 
 #[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, Clone, Copy)]
