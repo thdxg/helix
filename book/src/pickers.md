@@ -10,6 +10,16 @@ If a picker shows multiple columns, you may apply the filter to a specific colum
 
 You can insert the contents of a [register](./registers.md) using `Ctrl-r` followed by a register name. For example, one could insert the currently selected text using `Ctrl-r`-`.`, or the directory of the current file using `Ctrl-r`-`%` followed by `Ctrl-w` to remove the last path section. The global search picker will use the contents of the [search register](./registers.md#default-registers) if you press `Enter` without typing a filter. For example, pressing `*`-`Space-/`-`Enter` will start a global search for the currently selected text.
 
+### Modal pickers
+
+Picker actions are normally reached with modifier chords, because every
+unmodified key types into the query. Setting `modal = true` in the
+[`[editor.picker]`](./editor.md#editorpicker-section) section gives pickers a
+normal mode instead: `Escape` leaves the query, and unmodified keys such as `j`,
+`k` and `Enter` drive the picker until `i` takes you back to editing the query.
+The option is off by default, and while it is off `Escape` closes the picker as
+it always has. See the [modal picker keys](./keymap.md#modal-pickers).
+
 ### File explorer
 
 `Space-e` opens an interactive file explorer for browsing and opening files, rooted at the workspace; `Space-.` opens one rooted at the current buffer's directory. Unlike the file picker, the explorer does not ignore most files by default; its ignore behaviour is configured separately in the [`[editor.file-explorer]`](./editor.md#editorfile-explorer-section) section.

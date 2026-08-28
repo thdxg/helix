@@ -8,6 +8,7 @@
 - [`[editor.file-picker]` Section](#editorfile-picker-section)
 - [`[editor.file-explorer]` Section](#editorfile-explorer-section)
 - [`[editor.buffer-picker]` Section](#editorbuffer-picker-section)
+- [`[editor.picker]` Section](#editorpicker-section)
 - [`[editor.auto-pairs]` Section](#editorauto-pairs-section)
 - [`[editor.auto-save]` Section](#editorauto-save-section)
 - [`[editor.search]` Section](#editorsearch-section)
@@ -271,6 +272,33 @@ Example
 [editor.buffer-picker]
 start-position = "previous"
 ```
+
+### `[editor.picker]` Section
+
+Behaviour shared by every picker.
+
+| Key | Description | Default |
+|--|--|---------|
+|`modal` | Enables modal editing inside pickers, so that picker actions can be reached with unmodified keys instead of modifier chords | `false` |
+
+Example
+
+```toml
+[editor.picker]
+modal = true
+```
+
+A picker always opens in insert mode, where every key types into the query as
+usual. With `modal = true`, <kbd>Esc</kbd> leaves the query for normal mode
+instead of closing the picker; there, unmodified keys drive the picker and
+<kbd>q</kbd> or a second <kbd>Esc</kbd> closes it. See [the picker keymap] for
+the full list of normal-mode keys.
+
+With `modal = false`, the default, pickers behave exactly as they always have:
+<kbd>Esc</kbd> closes the picker and there is no normal mode to enter. The
+`Ctrl` bindings work the same either way.
+
+[the picker keymap]: ./keymap.md#picker
 
 ### `[editor.auto-pairs]` Section
 

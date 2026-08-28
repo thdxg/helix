@@ -8,7 +8,7 @@ use helix_core::hashmap;
 use helix_view::{theme::Style, Editor};
 use tui::text::Span;
 
-use crate::{alt, compositor::Context, job::Callback};
+use crate::{alt, compositor::Context, job::Callback, key};
 
 use super::prompt::Movement;
 use super::{
@@ -621,6 +621,18 @@ pub fn file_explorer(
         alt!('x') => file_operation_key(delete_selected),
         alt!('c') => file_operation_key(copy_selected),
         alt!('y') => file_operation_key(yank_selected_path),
+    })
+    // The same operations on unmodified keys, live only in the normal mode of
+    // a modal picker (`editor.picker.modal`). `d` can be the delete key here
+    // because normal mode never types into the query, unlike `Alt-d`, which
+    // the prompt owns and which therefore stays spelled `Alt-x` above.
+    .with_modal_key_handlers(hashmap! {
+        key!('n') => file_operation_key(create_file_or_directory),
+        key!('m') => file_operation_key(move_selected),
+        key!('r') => file_operation_key(rename_selected),
+        key!('d') => file_operation_key(delete_selected),
+        key!('c') => file_operation_key(copy_selected),
+        key!('y') => file_operation_key(yank_selected_path),
     });
 
     Ok(picker)

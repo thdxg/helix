@@ -8,6 +8,7 @@ use crate::{
     ui::{
         self,
         document::{render_document, LinePos, TextRenderer},
+        editor,
         picker::query::PickerQuery,
         text_decorations::DecorationManager,
         EditorView,
@@ -61,6 +62,65 @@ use self::handlers::{
 };
 
 pub const ID: &str = "picker";
+
+/// Which mode a picker's key handling is in, when `editor.picker.modal` is
+/// enabled. Modal handling is skipped entirely while it is disabled, so the
+/// mode is only ever consulted for a modal picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PickerMode {
+    /// Keys type into the query, as they always do in a non-modal picker.
+    #[default]
+    Insert,
+    /// Unmodified keys drive the picker instead of typing into the query.
+    Normal,
+}
+
+/// What a key does in [`PickerMode::Normal`]. See [`normal_mode_action`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NormalModeAction {
+    MoveNext,
+    MovePrevious,
+    ToStart,
+    ToEnd,
+    ScrollPreviewLineDown,
+    ScrollPreviewLineUp,
+    ScrollPreviewPageDown,
+    ScrollPreviewPageUp,
+    TogglePreview,
+    OpenVerticalSplit,
+    OpenHorizontalSplit,
+    EnterInsertMode,
+    Close,
+}
+
+/// The normal-mode keymap of a modal picker.
+///
+/// `None` means the key has no normal-mode binding of its own and is left to
+/// the picker's shared key handling, which still binds `Enter`, `Esc` and the
+/// `Ctrl-*` chords in both modes. A key that neither binds is swallowed rather
+/// than typed into the query — that is the point of normal mode.
+///
+/// The key is expected to have been canonicalized (see
+/// `ui::editor::canonicalize_key`), so that `Shift-G` and a bare `G` both
+/// arrive here as `G`.
+fn normal_mode_action(event: KeyEvent) -> Option<NormalModeAction> {
+    Some(match event {
+        key!('j') => NormalModeAction::MoveNext,
+        key!('k') => NormalModeAction::MovePrevious,
+        key!('g') => NormalModeAction::ToStart,
+        key!('G') => NormalModeAction::ToEnd,
+        key!('J') => NormalModeAction::ScrollPreviewLineDown,
+        key!('K') => NormalModeAction::ScrollPreviewLineUp,
+        key!('f') => NormalModeAction::ScrollPreviewPageDown,
+        key!('b') => NormalModeAction::ScrollPreviewPageUp,
+        key!('t') => NormalModeAction::TogglePreview,
+        key!('v') => NormalModeAction::OpenVerticalSplit,
+        key!('s') => NormalModeAction::OpenHorizontalSplit,
+        key!('i') | key!('a') | key!('/') => NormalModeAction::EnterInsertMode,
+        key!('q') => NormalModeAction::Close,
+        _ => return None,
+    })
+}
 
 pub const MIN_AREA_WIDTH_FOR_PREVIEW: u16 = 72;
 /// Biggest file size to preview in bytes
@@ -312,6 +372,13 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     /// Extra key bindings, checked before the picker's own key handling.
     /// See [`Picker::with_key_handlers`].
     key_handlers: PickerKeyHandlers<T, D>,
+    /// Extra key bindings which are only live in [`PickerMode::Normal`].
+    /// See [`Picker::with_modal_key_handlers`].
+    modal_key_handlers: PickerKeyHandlers<T, D>,
+    /// The picker's modal-editing mode. Only consulted when
+    /// `editor.picker.modal` is enabled; a picker always opens in
+    /// [`PickerMode::Insert`] so that typing filters right away.
+    mode: PickerMode,
 
     pub truncate_start: bool,
     /// Caches paths to documents
@@ -458,6 +525,8 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             callback_fn: Box::new(callback_fn),
             default_action: Action::Replace,
             key_handlers: HashMap::new(),
+            modal_key_handlers: HashMap::new(),
+            mode: PickerMode::Insert,
             completion_height: 0,
             widths,
             preview_cache: HashMap::new(),
@@ -534,12 +603,50 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         self
     }
 
+    /// Adds key bindings which are only live in [`PickerMode::Normal`], that is
+    /// only when `editor.picker.modal` is enabled and the user has left the
+    /// query with `Esc`.
+    ///
+    /// Because these keys never reach the query, they can be unmodified letters
+    /// which would otherwise be typed into it. Bind the same handlers here as in
+    /// [`Picker::with_key_handlers`] to offer a bare-key alternative to a
+    /// modifier chord.
+    ///
+    /// ```ignore
+    /// let picker = Picker::new(columns, 0, options, data, callback)
+    ///     .with_key_handlers(hashmap! {
+    ///         alt!('y') => file_operation_key(yank_selected_path),
+    ///     })
+    ///     .with_modal_key_handlers(hashmap! {
+    ///         key!('y') => file_operation_key(yank_selected_path),
+    ///     });
+    /// ```
+    pub fn with_modal_key_handlers(mut self, handlers: PickerKeyHandlers<T, D>) -> Self {
+        self.modal_key_handlers = handlers;
+        self
+    }
+
     /// Runs the [`Picker::with_key_handlers`] handler bound to `event`, if any.
     ///
     /// Returns `true` when a handler ran and the key should not be handled any
     /// further.
     fn handle_custom_key(&self, event: &KeyEvent, cx: &mut Context) -> bool {
-        let Some(handler) = self.key_handlers.get(event) else {
+        self.run_key_handler(&self.key_handlers, event, cx)
+    }
+
+    /// Runs the [`Picker::with_modal_key_handlers`] handler bound to `event`, if
+    /// any. Only called in [`PickerMode::Normal`].
+    fn handle_modal_key(&self, event: &KeyEvent, cx: &mut Context) -> bool {
+        self.run_key_handler(&self.modal_key_handlers, event, cx)
+    }
+
+    fn run_key_handler(
+        &self,
+        handlers: &PickerKeyHandlers<T, D>,
+        event: &KeyEvent,
+        cx: &mut Context,
+    ) -> bool {
+        let Some(handler) = handlers.get(event) else {
             return false;
         };
         let Some(selection) = self.selection() else {
@@ -556,6 +663,16 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         );
 
         true
+    }
+
+    /// Whether the picker is currently in modal normal mode, where unmodified
+    /// keys drive the picker rather than typing into the query.
+    ///
+    /// Always `false` while `editor.picker.modal` is disabled, which is the
+    /// default: turning the option off restores exactly the pre-modal
+    /// behaviour, `Esc` closing the picker included.
+    fn in_normal_mode(&self, editor: &Editor) -> bool {
+        editor.config().picker.modal && self.mode == PickerMode::Normal
     }
 
     pub fn with_dynamic_query(
@@ -1012,8 +1129,28 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             snapshot.item_count(),
         );
 
+        // The mode indicator only exists for a modal picker; a non-modal one
+        // renders its prompt line exactly as it always has.
+        let mode = cx.editor.config().picker.modal.then(|| match self.mode {
+            PickerMode::Insert => ("INS ", cx.editor.theme.get("ui.statusline.insert")),
+            PickerMode::Normal => ("NOR ", cx.editor.theme.get("ui.statusline.normal")),
+        });
+        let mode_width = mode.map_or(0, |(label, _)| label.len() as u16);
+
         let area = inner.clip_left(1).with_height(1);
-        let line_area = area.clip_right(count.len() as u16 + 1);
+        let line_area = area
+            .clip_left(mode_width)
+            .clip_right(count.len() as u16 + 1);
+
+        if let Some((label, style)) = mode {
+            surface.set_stringn(
+                area.x,
+                area.y,
+                label,
+                (mode_width as usize).min(area.width as usize),
+                style,
+            );
+        }
 
         // render the prompt first since it will clear its background
         self.prompt.render(line_area, surface, cx);
@@ -1559,6 +1696,11 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
     fn handle_event(&mut self, event: &Event, ctx: &mut Context) -> EventResult {
         let key_event = match event {
             Event::Key(event) => *event,
+            // A paste is query text, so it is swallowed in normal mode just
+            // like a typed key would be.
+            Event::Paste(..) if self.in_normal_mode(ctx.editor) => {
+                return EventResult::Consumed(None)
+            }
             Event::Paste(..) => return self.prompt_handle_event(event, ctx),
             Event::Resize(..) => return EventResult::Consumed(None),
             // Picker is a modal and should consume mouse events so clicks don't fall
@@ -1596,6 +1738,91 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
         // the built-in ones.
         if self.handle_custom_key(&key_event, ctx) {
             return EventResult::Consumed(None);
+        }
+
+        // Modal editing, when `editor.picker.modal` is enabled. `Esc` leaves the
+        // query for normal mode instead of closing the picker, and normal mode
+        // binds unmodified keys to the picker's actions. Everything below this
+        // block — `Enter`, the `Ctrl-*` bindings, the arrow keys — keeps working
+        // identically in both modes, and none of it is reached at all while the
+        // option is off.
+        if ctx.editor.config().picker.modal {
+            // A terminal speaking the Kitty keyboard protocol reports `G` as
+            // `Shift-G`; fold that back so both spellings hit the same binding.
+            let mut key_event = key_event;
+            editor::canonicalize_key(&mut key_event);
+
+            match self.mode {
+                PickerMode::Insert => {
+                    if key_event == key!(Esc) {
+                        self.mode = PickerMode::Normal;
+                        return EventResult::Consumed(None);
+                    }
+                }
+                PickerMode::Normal => {
+                    // Bare-key bindings supplied by the picker's creator, which
+                    // exist only in normal mode.
+                    if self.handle_modal_key(&key_event, ctx) {
+                        return EventResult::Consumed(None);
+                    }
+
+                    // The preview-scroll keys are guarded like the `Alt-j` and
+                    // `Alt-k` arms below: with no preview on screen there is
+                    // nothing to scroll, so they act as if unbound.
+                    let action = match normal_mode_action(key_event) {
+                        Some(
+                            NormalModeAction::ScrollPreviewLineDown
+                            | NormalModeAction::ScrollPreviewLineUp
+                            | NormalModeAction::ScrollPreviewPageDown
+                            | NormalModeAction::ScrollPreviewPageUp,
+                        ) if !self.preview_shown() => None,
+                        action => action,
+                    };
+
+                    // An unbound key falls through to the shared handling
+                    // below. `Esc` closes there, as do `Enter` and the `Ctrl-*`
+                    // bindings; anything the shared handling does not bind
+                    // either reaches its fallback arm, which swallows the key in
+                    // normal mode rather than typing it into the query.
+                    if let Some(action) = action {
+                        match action {
+                            NormalModeAction::Close => return close_fn(self),
+                            NormalModeAction::OpenVerticalSplit => {
+                                if let Some(option) = self.selection() {
+                                    (self.callback_fn)(ctx, option, Action::VerticalSplit);
+                                }
+                                return close_fn(self);
+                            }
+                            NormalModeAction::OpenHorizontalSplit => {
+                                if let Some(option) = self.selection() {
+                                    (self.callback_fn)(ctx, option, Action::HorizontalSplit);
+                                }
+                                return close_fn(self);
+                            }
+                            NormalModeAction::MoveNext => self.move_by(1, Direction::Forward),
+                            NormalModeAction::MovePrevious => self.move_by(1, Direction::Backward),
+                            NormalModeAction::ToStart => self.to_start(),
+                            NormalModeAction::ToEnd => self.to_end(),
+                            NormalModeAction::ScrollPreviewLineDown => {
+                                self.scroll_preview_line_down(ctx.editor)
+                            }
+                            NormalModeAction::ScrollPreviewLineUp => {
+                                self.scroll_preview_line_up(ctx.editor)
+                            }
+                            NormalModeAction::ScrollPreviewPageDown => {
+                                self.scroll_preview_page_down(ctx.editor)
+                            }
+                            NormalModeAction::ScrollPreviewPageUp => {
+                                self.scroll_preview_page_up(ctx.editor)
+                            }
+                            NormalModeAction::TogglePreview => self.toggle_preview(),
+                            NormalModeAction::EnterInsertMode => self.mode = PickerMode::Insert,
+                        }
+
+                        return EventResult::Consumed(None);
+                    }
+                }
+            }
         }
 
         match key_event {
@@ -1698,6 +1925,10 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             alt!('j') | shift!(Down) if self.preview_shown() => {
                 self.scroll_preview_line_down(ctx.editor);
             }
+            // In modal normal mode an unbound key is swallowed. Handing it to
+            // the prompt would type it into the query, which is exactly what
+            // normal mode exists to avoid.
+            _ if self.in_normal_mode(ctx.editor) => {}
             _ => {
                 self.prompt_handle_event(event, ctx);
             }
@@ -1720,7 +1951,14 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
         } else {
             area.width
         };
-        let area = inner.clip_left(1).with_height(1).with_width(picker_width);
+        // Keep in step with `render_picker`: a modal picker reserves room for
+        // the mode indicator at the head of the prompt line.
+        let mode_width = if editor.config().picker.modal { 4 } else { 0 };
+        let area = inner
+            .clip_left(1)
+            .with_height(1)
+            .with_width(picker_width)
+            .clip_left(mode_width);
 
         self.prompt.cursor(area, editor)
     }
@@ -1764,3 +2002,82 @@ pub type PickerKeyHandler<T, D> = Box<dyn Fn(&mut Context, PickerAction<'_, T, D
 
 /// The extra key bindings of a picker, keyed by the key event that triggers them.
 pub type PickerKeyHandlers<T, D> = HashMap<KeyEvent, PickerKeyHandler<T, D>>;
+
+#[cfg(test)]
+mod modal_test {
+    use super::*;
+    use crate::ui::editor::canonicalize_key;
+
+    /// The action a key triggers in normal mode, after the same
+    /// canonicalization the picker applies to an incoming key.
+    fn action(key: &str) -> Option<NormalModeAction> {
+        let mut event: KeyEvent = key.parse().unwrap();
+        canonicalize_key(&mut event);
+        normal_mode_action(event)
+    }
+
+    #[test]
+    fn normal_mode_keymap() {
+        assert_eq!(action("j"), Some(NormalModeAction::MoveNext));
+        assert_eq!(action("k"), Some(NormalModeAction::MovePrevious));
+        assert_eq!(action("g"), Some(NormalModeAction::ToStart));
+        assert_eq!(action("G"), Some(NormalModeAction::ToEnd));
+        assert_eq!(action("J"), Some(NormalModeAction::ScrollPreviewLineDown));
+        assert_eq!(action("K"), Some(NormalModeAction::ScrollPreviewLineUp));
+        assert_eq!(action("f"), Some(NormalModeAction::ScrollPreviewPageDown));
+        assert_eq!(action("b"), Some(NormalModeAction::ScrollPreviewPageUp));
+        assert_eq!(action("t"), Some(NormalModeAction::TogglePreview));
+        assert_eq!(action("v"), Some(NormalModeAction::OpenVerticalSplit));
+        assert_eq!(action("s"), Some(NormalModeAction::OpenHorizontalSplit));
+        assert_eq!(action("q"), Some(NormalModeAction::Close));
+        for key in ["i", "a", "/"] {
+            assert_eq!(action(key), Some(NormalModeAction::EnterInsertMode));
+        }
+    }
+
+    #[test]
+    fn uppercase_keys_match_with_or_without_the_shift_modifier() {
+        // A terminal speaking the Kitty keyboard protocol reports `G` as
+        // `Shift-G`; both spellings must reach the same binding.
+        assert_eq!(action("G"), action("S-G"));
+        assert_eq!(action("J"), action("S-J"));
+        assert_eq!(action("K"), action("S-K"));
+    }
+
+    #[test]
+    fn unbound_normal_mode_keys_are_not_query_text() {
+        // These fall through to the picker's shared key handling, whose
+        // fallback arm swallows them in normal mode instead of typing them into
+        // the query.
+        for key in ["x", "z", "1", "-", "%"] {
+            assert_eq!(action(key), None, "{key} should have no normal-mode action");
+        }
+
+        // `Esc` and `Enter` deliberately have no entry of their own: the shared
+        // handling closes and opens with them in both modes.
+        assert_eq!(action("esc"), None);
+        assert_eq!(action("ret"), None);
+
+        // Neither do the `Ctrl-*` chords, which keep working identically in
+        // both modes.
+        for key in ["C-s", "C-v", "C-t", "C-n", "C-p", "C-d", "C-u", "C-c"] {
+            assert_eq!(action(key), None, "{key} should be left to shared handling");
+        }
+    }
+
+    #[test]
+    fn modal_key_handlers_do_not_collide_with_the_normal_mode_keymap() {
+        // The file explorer binds these bare keys through
+        // `with_modal_key_handlers`, which is consulted before the keymap
+        // above; if one were also a built-in normal-mode key the binding would
+        // be unreachable.
+        for key in ["n", "m", "r", "d", "c", "y"] {
+            assert_eq!(action(key), None, "{key} is claimed twice");
+        }
+    }
+
+    #[test]
+    fn a_picker_opens_in_insert_mode() {
+        assert_eq!(PickerMode::default(), PickerMode::Insert);
+    }
+}

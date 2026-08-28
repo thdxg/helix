@@ -19,6 +19,8 @@
 - [Insert mode](#insert-mode)
 - [Select / extend mode](#select--extend-mode)
 - [Picker](#picker)
+  - [Modal pickers](#modal-pickers)
+  - [File explorer](#file-explorer)
 - [Prompt](#prompt)
 
 > 💡 Mappings marked (**LSP**) require an active language server for the file.
@@ -490,6 +492,41 @@ See the documentation page on [pickers](./pickers.md) for more info.
 
 > 💡 The preview scroll keys act on whatever the preview shows: a file scrolls by visual lines, so soft-wrapped lines can be read to the end; a PDF turns one page per press; and an image taller than the preview pane is fitted to its width and panned vertically.
 
+### Modal pickers
+
+Setting `modal = true` in the [`[editor.picker]`](./editor.md#editorpicker-section)
+section of `config.toml` gives pickers a normal mode, so that the actions above
+can be reached with unmodified keys instead of modifier chords.
+
+```toml
+[editor.picker]
+modal = true
+```
+
+A picker still opens in insert mode, where keys type into the query as usual, so
+filtering works the moment the picker appears. `Escape` then leaves the query for
+normal mode rather than closing the picker, and the prompt line shows `INS` or
+`NOR` to say which mode the picker is in.
+
+| Key                          | Description                                                |
+| -----                        | -------------                                              |
+| `j`, `k`                     | Next / previous entry                                      |
+| `g`, `G`                     | Go to first / last entry                                   |
+| `J`, `K`                     | Scroll the preview down / up a line                        |
+| `f`, `b`                     | Scroll the preview down / up a page                        |
+| `v`, `s`                     | Open vertically / horizontally                             |
+| `t`                          | Toggle preview                                             |
+| `i`, `a`, `/`                | Go back to insert mode to edit the query                   |
+| `Enter`                      | Open selected                                              |
+| `q`, `Escape`                | Close picker                                               |
+
+`Enter` and every `Ctrl` binding in the table above keep working in both modes,
+so nothing has to be relearned. A key that normal mode does not bind is
+swallowed rather than typed into the query.
+
+With `modal = false`, the default, none of this applies: `Escape` closes the
+picker and every key types into the query, exactly as before.
+
 ### File explorer
 
 These extra keys are available in the file explorer (`Space-e` and `Space-.`).
@@ -516,6 +553,21 @@ names, not against the working directory.
 `Alt-n` creates any missing intermediate directories. `Alt-c` does not support
 directories. `Alt-m`, `Alt-r` and `Alt-x` refuse to act on the `..` entry, and
 `Alt-x` will not delete anything outside the directory the explorer is showing.
+
+In the normal mode of a [modal picker](#modal-pickers) the same operations are
+also on unmodified keys. The `Alt` bindings above keep working in both modes.
+
+| Key                          | Description                                                |
+| -----                        | -------------                                              |
+| `n`                          | Create a new file, or a directory if the name ends with `/`|
+| `m`                          | Move the selected file or directory                        |
+| `r`                          | Rename the selected file or directory                      |
+| `d`                          | Delete the selected file or directory                      |
+| `c`                          | Copy the selected file                                     |
+| `y`                          | Yank the path of the selected file or directory            |
+
+Delete is `d` here rather than `x`, since normal mode never types into the query
+and so does not have to avoid the `Alt-d` the prompt owns.
 
 ## Prompt
 
