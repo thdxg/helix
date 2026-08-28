@@ -210,7 +210,6 @@ pub(super) fn spawn_preview_raster<T: 'static + Send + Sync, D: 'static + Send +
     request: helix_view::media::RasterRequest,
 ) {
     tokio::task::spawn_blocking(move || {
-        let page = request.page();
         let raster = request.run();
 
         job::dispatch_blocking(move |editor, compositor| {
@@ -226,7 +225,7 @@ pub(super) fn spawn_preview_raster<T: 'static + Send + Sync, D: 'static + Send +
             else {
                 return;
             };
-            if let Err(err) = media.finish_raster(page, raster) {
+            if let Err(err) = media.finish_raster(&request, raster) {
                 editor.set_error(err.to_string());
             }
         });
