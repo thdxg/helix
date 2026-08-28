@@ -281,10 +281,10 @@ impl EditorView {
 
     /// Rasterize a PDF page on a blocking task and hand the result back to the
     /// document it belongs to. A result for a page that has since been paged
-    /// away from is discarded by `finish_raster`.
+    /// away from -- or for a file that has since been reloaded -- is discarded
+    /// by `finish_raster`.
     pub(super) fn spawn_raster(doc_id: DocumentId, request: helix_view::media::RasterRequest) {
         tokio::task::spawn_blocking(move || {
-            let page = request.page();
             let raster = request.run();
             crate::job::dispatch_blocking(move |editor, _compositor| {
                 let Some(media) = editor
@@ -294,7 +294,7 @@ impl EditorView {
                 else {
                     return;
                 };
-                if let Err(err) = media.finish_raster(page, raster) {
+                if let Err(err) = media.finish_raster(&request, raster) {
                     editor.set_error(err.to_string());
                 }
             });

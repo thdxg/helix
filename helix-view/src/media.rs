@@ -385,6 +385,57 @@ impl MediaState {
         })
     }
 
+    /// Re-read the file after it changed on disk, staying on the page being
+    /// read. The page is rasterized here rather than left to the background
+    /// pass so the reload swaps one page for the same page of the new file:
+    /// opening afresh would rasterize page one and display it for the frames
+    /// it takes the page being read to come back, flashing the front of the
+    /// document over the reader's place in it.
+    ///
+    /// The page is clamped -- the new file may be shorter -- and falls back to
+    /// the first page when the file has no page count to clamp against and the
+    /// page turns out to be gone. Nothing is touched when the new file cannot
+    /// be rendered at all, so a file caught mid-write keeps showing the page it
+    /// had.
+    pub fn reload(&mut self) -> Result<()> {
+        let mtime = self
+            .source
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let (page_count, page, raster) = match self.kind {
+            MediaKind::Image => (None, 0, image_to_png(&self.source, mtime)?),
+            MediaKind::Pdf => {
+                let page_count = pdf_page_count(&self.source);
+                let page = match page_count {
+                    Some(count) => self.page.min(count.saturating_sub(1)),
+                    None => self.page,
+                };
+                match raster_pdf_page(&self.source, mtime, page) {
+                    Ok(raster) => (page_count, page, raster),
+                    // No page count to clamp against and the page is gone:
+                    // fall back to the first page, which every document has.
+                    Err(err) if page > 0 => (
+                        page_count,
+                        0,
+                        raster_pdf_page(&self.source, mtime, 0).map_err(|_| err)?,
+                    ),
+                    Err(err) => return Err(err),
+                }
+            }
+        };
+        self.mtime = mtime;
+        self.page_count = page_count;
+        self.page = page;
+        self.rastered = page;
+        self.raster = raster;
+        // A rasterize started against the old file is left to run; its result
+        // is discarded by `finish_raster`, which only accepts a request made
+        // for the file we now hold.
+        self.pending = None;
+        Ok(())
+    }
+
     /// Switch to a zero-based page. The page is rasterized lazily, by
     /// [`MediaState::ensure_raster`] at render time; this only fails when the
     /// page is known not to exist.
@@ -408,8 +459,13 @@ impl MediaState {
         if self.rastered == self.page {
             return Ok(());
         }
-        let raster = raster_pdf_page(&self.source, self.mtime, self.page);
-        self.finish_raster(self.page, raster)
+        let request = RasterRequest {
+            source: self.source.clone(),
+            mtime: self.mtime,
+            page: self.page,
+        };
+        let raster = request.run();
+        self.finish_raster(&request, raster)
     }
 
     /// Whether [`MediaState::raster`] still shows an earlier page than
@@ -435,13 +491,16 @@ impl MediaState {
         })
     }
 
-    /// Install the result of a rasterize, or discard it if paging has moved on
-    /// since it started.
-    pub fn finish_raster(&mut self, page: usize, raster: Result<Raster>) -> Result<()> {
+    /// Install the result of a rasterize, or discard it if paging -- or a
+    /// reload -- has moved on since it started.
+    pub fn finish_raster(&mut self, request: &RasterRequest, raster: Result<Raster>) -> Result<()> {
+        let page = request.page;
         if self.pending == Some(page) {
             self.pending = None;
         }
-        if page != self.page {
+        // A raster of the file as it was before an external change is not the
+        // page we are showing any more, however well the page number matches.
+        if page != self.page || request.mtime != self.mtime {
             return Ok(());
         }
         match raster {
@@ -600,6 +659,7 @@ fn pdf_page_count(source: &Path) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn base64_known_vectors() {
@@ -704,16 +764,36 @@ mod tests {
             "only one rasterize runs at a time"
         );
         // Its result is for a page long gone, so it is dropped, not displayed.
-        state.finish_raster(1, Ok(test_raster(2))).unwrap();
+        state.finish_raster(&request, Ok(test_raster(2))).unwrap();
         assert_eq!(state.raster.id, 1);
         assert!(state.is_rastering());
         // The next frame picks up the page actually landed on.
         let request = state.take_raster_request().expect("page 6 rasterizes");
         assert_eq!(request.page(), 5);
-        state.finish_raster(5, Ok(test_raster(2))).unwrap();
+        state.finish_raster(&request, Ok(test_raster(2))).unwrap();
         assert_eq!(state.raster.id, 2);
         assert!(!state.is_rastering());
         assert!(state.take_raster_request().is_none());
+    }
+
+    #[test]
+    fn a_raster_of_the_file_as_it_was_is_discarded() {
+        // A rasterize in flight when the file changes on disk comes back with
+        // the right page number but the wrong contents: the reload has already
+        // put the new file's page on screen, and installing this would show the
+        // old one again.
+        let mut state = pdf_state(Some(10));
+        state.goto_page(3).unwrap();
+        let stale = state.take_raster_request().expect("page 4 rasterizes");
+        // The file changes; `reload` re-rasterizes page 4 against the new mtime.
+        state.mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        state.rastered = 3;
+        state.pending = None;
+        state.raster = test_raster(7);
+
+        state.finish_raster(&stale, Ok(test_raster(2))).unwrap();
+        assert_eq!(state.raster.id, 7, "stale raster displayed");
+        assert!(!state.is_rastering());
     }
 
     #[test]
@@ -724,7 +804,7 @@ mod tests {
         state.goto_page(4).unwrap();
         let request = state.take_raster_request().unwrap();
         assert!(state
-            .finish_raster(request.page(), Err(anyhow!("no page 5")))
+            .finish_raster(&request, Err(anyhow!("no page 5")))
             .is_err());
         assert_eq!(state.page, 0, "stays on the page it can still show");
         assert!(!state.is_rastering());

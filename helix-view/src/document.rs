@@ -1350,22 +1350,11 @@ impl Document {
 
         // Media documents re-rasterize instead of reloading text. The new
         // raster gets a fresh image id (mtime is hashed in), so the next
-        // render retransmits automatically.
-        if let Some(media) = &self.media {
-            let kind = media.kind;
-            let old_page = media.page;
-            let mut state =
-                crate::media::MediaState::open(kind, &path).map_err(|err| anyhow!("{err}"))?;
-            // Stay on the page being read (clamped: the new file may be
-            // shorter); fall back to the first page if it can't be rastered.
-            if old_page > 0 {
-                let target = match state.page_count {
-                    Some(count) => old_page.min(count.saturating_sub(1)),
-                    None => old_page,
-                };
-                let _ = state.goto_page(target);
-            }
-            self.media = Some(state);
+        // render retransmits automatically. The rasterize happens here, on the
+        // page being read, so the reader's page is simply replaced -- see
+        // `MediaState::reload`.
+        if let Some(media) = &mut self.media {
+            media.reload().map_err(|err| anyhow!("{err}"))?;
             // Record the on-disk mtime like the text path does, so the
             // auto-reload poll sees the document as up to date instead of
             // re-rasterizing on every tick.
