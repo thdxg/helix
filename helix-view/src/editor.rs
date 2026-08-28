@@ -1353,6 +1353,45 @@ use futures_util::stream::{Flatten, Once};
 
 type Diagnostics = BTreeMap<Uri, Vec<(lsp::Diagnostic, DiagnosticProvider)>>;
 
+/// Whether the paths on [`ExplorerClipboard`] are to be moved or duplicated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardMode {
+    /// The entries move to the paste destination and the clipboard is emptied
+    /// once they have.
+    Cut,
+    /// The entries are duplicated into the paste destination and stay on the
+    /// clipboard, so a copy can be pasted into several places in a row.
+    Copy,
+}
+
+/// Paths the file explorer has staged for a paste.
+///
+/// The paths are a `Vec` even though the explorer selects a single entry today,
+/// so that a multi-select can fill it later without changing this shape.
+#[derive(Debug, Clone)]
+pub struct ExplorerClipboard {
+    pub paths: Vec<PathBuf>,
+    pub mode: ClipboardMode,
+}
+
+impl ExplorerClipboard {
+    /// Drops `path` from the clipboard now that a paste has carried it out, and
+    /// reports whether anything is still staged.
+    ///
+    /// Only a cut is spent this way; a copy stays staged so that it can be
+    /// pasted into several directories in a row. Keying this off the path that
+    /// was just pasted rather than off the caller's control flow keeps it right
+    /// even when the paste went through an overwrite confirmation, which returns
+    /// to the caller long before the file is written.
+    pub fn consume(&mut self, path: &Path) -> bool {
+        if self.mode == ClipboardMode::Cut {
+            self.paths.retain(|staged| staged != path);
+        }
+
+        !self.paths.is_empty()
+    }
+}
+
 pub struct Editor {
     /// Current editing mode.
     pub mode: Mode,
@@ -1369,6 +1408,12 @@ pub struct Editor {
     pub count: Option<std::num::NonZeroUsize>,
     pub selected_register: Option<char>,
     pub registers: Registers,
+    /// What the file explorer has staged for a paste, if anything.
+    ///
+    /// This lives on the editor rather than on the explorer's picker because
+    /// every file operation rebuilds that picker from scratch, so picker-local
+    /// state would be thrown away between the cut and the paste.
+    pub explorer_clipboard: Option<ExplorerClipboard>,
     pub macro_recording: Option<(char, Vec<KeyEvent>)>,
     pub macro_replaying: Vec<char>,
     pub language_servers: helix_lsp::Registry,
@@ -1544,6 +1589,7 @@ impl Editor {
             write_count: 0,
             count: None,
             selected_register: None,
+            explorer_clipboard: None,
             macro_recording: None,
             macro_replaying: Vec::new(),
             theme: theme_loader.default(),
@@ -1785,7 +1831,18 @@ impl Editor {
         }
 
         if old_path.exists() {
-            fs::rename(old_path, &new_path)?;
+            match fs::rename(old_path, &new_path) {
+                Ok(()) => (),
+                // `rename(2)` cannot move an entry between filesystems, which is
+                // easy to hit moving something out of a mounted volume or a
+                // `tmpfs`. Copy the tree across and delete the original instead,
+                // which is what `mv` falls back to.
+                Err(err) if err.kind() == io::ErrorKind::CrossesDevices => {
+                    helix_stdx::path::copy_all(old_path, &new_path)?;
+                    helix_stdx::path::remove_all(old_path)?;
+                }
+                Err(err) => return Err(err),
+            }
         }
 
         if let Some(doc) = self.document_by_path(old_path) {
@@ -2861,5 +2918,51 @@ impl CursorCache {
 
     pub fn reset(&self) {
         self.0.set(None)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::{ClipboardMode, ExplorerClipboard};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn a_cut_is_spent_by_the_paste_that_carries_it_out() {
+        let mut clipboard = ExplorerClipboard {
+            paths: vec![PathBuf::from("/project/a"), PathBuf::from("/project/b")],
+            mode: ClipboardMode::Cut,
+        };
+
+        // With another entry still staged the clipboard stays alive.
+        assert!(clipboard.consume(Path::new("/project/a")));
+        assert_eq!(clipboard.paths, vec![PathBuf::from("/project/b")]);
+
+        // Pasting the last one leaves nothing staged.
+        assert!(!clipboard.consume(Path::new("/project/b")));
+        assert!(clipboard.paths.is_empty());
+    }
+
+    #[test]
+    fn a_copy_stays_staged_so_it_can_be_pasted_again() {
+        let mut clipboard = ExplorerClipboard {
+            paths: vec![PathBuf::from("/project/a")],
+            mode: ClipboardMode::Copy,
+        };
+
+        for _ in 0..3 {
+            assert!(clipboard.consume(Path::new("/project/a")));
+            assert_eq!(clipboard.paths, vec![PathBuf::from("/project/a")]);
+        }
+    }
+
+    #[test]
+    fn consuming_an_unstaged_path_leaves_the_clipboard_alone() {
+        let mut clipboard = ExplorerClipboard {
+            paths: vec![PathBuf::from("/project/a")],
+            mode: ClipboardMode::Cut,
+        };
+
+        assert!(clipboard.consume(Path::new("/project/elsewhere")));
+        assert_eq!(clipboard.paths, vec![PathBuf::from("/project/a")]);
     }
 }
