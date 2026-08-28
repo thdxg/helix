@@ -200,6 +200,39 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> AsyncHook for PreviewMe
     }
 }
 
+/// Rasterize a PDF page for a cached picker preview off the main thread and
+/// hand the result back to the picker's preview cache, the way
+/// `EditorView::spawn_raster` does for a media document open in the editor. A
+/// result for a page the preview has since paged away from is discarded by
+/// `finish_raster`.
+pub(super) fn spawn_preview_raster<T: 'static + Send + Sync, D: 'static + Send + Sync>(
+    path: Arc<Path>,
+    request: helix_view::media::RasterRequest,
+) {
+    tokio::task::spawn_blocking(move || {
+        let page = request.page();
+        let raster = request.run();
+
+        job::dispatch_blocking(move |editor, compositor| {
+            let Some(Overlay {
+                content: picker, ..
+            }) = compositor.find::<Overlay<Picker<T, D>>>()
+            else {
+                log::info!("picker closed before the PDF page finished rendering");
+                return;
+            };
+            let Some(CachedPreview::Media(MediaPreview::Ready(media))) =
+                picker.preview_cache.get_mut(&path)
+            else {
+                return;
+            };
+            if let Err(err) = media.finish_raster(page, raster) {
+                editor.set_error(err.to_string());
+            }
+        });
+    });
+}
+
 pub(super) struct DynamicQueryChange {
     pub query: Arc<str>,
     pub is_paste: bool,
