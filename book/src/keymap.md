@@ -245,6 +245,8 @@ Jumps to various locations.
 | `k`   | Move up textual (instead of visual) line         | `move_line_up`             |
 | `w`   | Show labels at each word and select the word that belongs to the entered labels | `goto_word` |
 
+> 💡 On a PDF buffer these keys move by page instead of by line: `<n>g` and `<n>G` go to page `<n>` (clamped to the last page), `g` to the first page and `ge` to the last. `h`/`k` and `j`/`l` turn one page at a time, and `:media-goto-page` takes a page number from the command line.
+
 #### Match mode
 
 Accessed by typing `m` in [normal mode](#normal-mode).
