@@ -404,6 +404,7 @@ impl MappableCommand {
         search_selection_detect_word_boundaries, "Use current selection as the search pattern, automatically wrapping with `\\b` on word boundaries",
         make_search_word_bounded, "Modify current search to make it word bounded",
         global_search, "Global search in workspace folder",
+        buffer_search, "Fuzzy search the lines of the current buffer",
         extend_line, "Select current line, if already selected, extend to another line based on the anchor",
         extend_line_below, "Select current line, if already selected, extend to next line",
         extend_line_above, "Select current line, if already selected, extend to previous line",
@@ -2861,6 +2862,134 @@ fn global_search(cx: &mut Context) {
     )
     .with_history_register(Some(reg))
     .with_dynamic_query(get_files, Some(275));
+
+    cx.push_layer(Box::new(overlaid(picker)));
+}
+
+/// A fuzzy picker over the lines of the currently focused document.
+fn buffer_search(cx: &mut Context) {
+    /// One non-blank line of the document. The line's text lives in
+    /// [`BufferSearchData::text`]; items only carry offsets into it so that the
+    /// buffer is copied once rather than once per line.
+    struct BufferLine {
+        /// 0 indexed line number in the document.
+        line: usize,
+        /// Byte range of the line's text (without its line ending) within
+        /// [`BufferSearchData::text`].
+        start: usize,
+        end: usize,
+    }
+
+    struct BufferSearchData {
+        /// The non-blank lines of the document, stripped of their line endings
+        /// and concatenated. Indexed by [`BufferLine::start`]/[`BufferLine::end`].
+        text: String,
+        number_style: Style,
+        /// Width to pad line numbers out to, so that they are right aligned
+        /// like the line number gutter.
+        number_width: usize,
+    }
+
+    let doc = doc!(cx.editor);
+    let doc_id = doc.id();
+    let rope = doc.text();
+
+    let mut text = String::with_capacity(rope.len_bytes());
+    let mut lines = Vec::with_capacity(rope.len_lines());
+    for (line, slice) in rope.lines().enumerate() {
+        let start = text.len();
+        text.extend(slice.chunks());
+        // The picker shows and matches one line at a time, so the line ending
+        // is of no use to us.
+        if let Some(line_ending) = get_line_ending_of_str(&text[start..]) {
+            text.truncate(text.len() - line_ending.as_str().len());
+        }
+        // A blank line can never match a non-empty query, so it would only pad
+        // out the list. Drop it, and its bytes with it.
+        if text[start..].trim().is_empty() {
+            text.truncate(start);
+            continue;
+        }
+        let end = text.len();
+        lines.push(BufferLine { line, start, end });
+    }
+
+    let data = BufferSearchData {
+        text,
+        number_style: cx.editor.theme.get("constant.numeric.integer"),
+        number_width: rope.len_lines().to_string().len(),
+    };
+
+    let columns = [
+        PickerColumn::new("line", |item: &BufferLine, data: &BufferSearchData| {
+            let line = format!("{:>1$}", item.line + 1, data.number_width);
+            Cell::from(Span::styled(line, data.number_style))
+        })
+        // Line numbers are shown for orientation only: typing digits should
+        // filter the contents rather than the numbering.
+        .without_filtering(),
+        PickerColumn::new("contents", |item: &BufferLine, data: &BufferSearchData| {
+            Cell::from(Span::raw(&data.text[item.start..item.end]))
+        }),
+    ];
+
+    let picker = Picker::new(
+        columns,
+        1, // contents
+        [],
+        data,
+        move |cx, &BufferLine { line, .. }, action| {
+            let (view, doc) = current!(cx.editor);
+            push_jump(view, doc);
+            cx.editor.switch(doc_id, action);
+
+            let (view, doc) = current!(cx.editor);
+            let text = doc.text();
+            // The document may have been reloaded from disk under the picker.
+            if line >= text.len_lines() {
+                cx.editor.set_error(
+                    "The line you jumped to does not exist anymore because the file has changed.",
+                );
+                return;
+            }
+            let start = text.line_to_char(line);
+            let end = text.line_to_char((line + 1).min(text.len_lines()));
+
+            doc.set_selection(view.id, Selection::single(start, end));
+            if action.align_view(view, doc.id()) {
+                align_view(doc, view, Align::Center);
+            }
+        },
+    )
+    .with_preview(move |_editor, &BufferLine { line, .. }| {
+        Some((doc_id.into(), Some((line, line))))
+    })
+    .truncate_start(false);
+
+    // Injecting every line of a large buffer can take a while, so seed the
+    // picker with as much as fits in a frame and finish the rest off-thread.
+    let injector = picker.injector();
+    let mut lines = lines.into_iter();
+    let timeout = std::time::Instant::now() + std::time::Duration::from_millis(30);
+    let mut hit_timeout = false;
+    for line in &mut lines {
+        if injector.push(line).is_err() {
+            break;
+        }
+        if std::time::Instant::now() >= timeout {
+            hit_timeout = true;
+            break;
+        }
+    }
+    if hit_timeout {
+        std::thread::spawn(move || {
+            for line in lines {
+                if injector.push(line).is_err() {
+                    break;
+                }
+            }
+        });
+    }
 
     cx.push_layer(Box::new(overlaid(picker)));
 }
