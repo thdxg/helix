@@ -28,4 +28,4 @@ The explorer can also act on the entry under the cursor: `Alt-n` creates a file 
 
 There is also a clipboard: `Alt-t` cuts the selected entry and `Alt-w` copies it, and `Alt-p` pastes whatever is staged into the directory the explorer is showing. Directories are pasted with everything in them. A cut is spent by the paste that carries it out, while a copy stays staged and can be pasted repeatedly. See the [file explorer clipboard](./keymap.md#file-explorer-clipboard).
 
-In a modal picker the explorer puts a yazi-like layout on unmodified keys — `a` create, `r` rename, `d` cut, `y` copy, `p` paste, `D` delete, `Y` yank path and `m` move. See the [modal file explorer keys](./keymap.md#file-explorer-modal-pickers).
+In a modal picker the explorer puts a yazi-like layout on unmodified keys — `h` and `l` walk up and down the tree, and `a` create, `r` rename, `d` cut, `y` copy, `p` paste, `D` delete, `Y` yank path and `m` move. See the [modal file explorer keys](./keymap.md#file-explorer-modal-pickers).

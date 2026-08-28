@@ -521,7 +521,7 @@ normal mode rather than closing the picker, and the prompt line shows `INS` or
 | `v`, `s`                     | Open vertically / horizontally                             |
 | `t`                          | Toggle preview                                             |
 | `i`, `a`, `/`                | Go back to insert mode to edit the query                   |
-| `Enter`                      | Open selected                                              |
+| `l`, `Enter`                 | Open selected                                              |
 | `q`, `Escape`                | Close picker                                               |
 
 `Enter` and every `Ctrl` binding in the table above keep working in both modes,
@@ -584,6 +584,8 @@ both modes.
 
 | Key                          | Description                                                |
 | -----                        | -------------                                              |
+| `h`                          | Go to the parent of the directory being shown              |
+| `l`                          | Enter the selected directory, or open the selected file    |
 | `a`                          | Create a new file, or a directory if the name ends with `/`|
 | `r`                          | Rename the selected file or directory                      |
 | `d`                          | Cut the selected entry to the explorer clipboard           |
@@ -592,6 +594,12 @@ both modes.
 | `D`                          | Delete the selected file or directory                      |
 | `Y`                          | Yank the path of the selected file or directory            |
 | `m`                          | Move the selected file or directory to a typed destination |
+
+`h` and `l` walk the tree as they do in yazi. `l` is the [modal picker](#modal-pickers)
+binding for "open selected", so on a directory it descends and on a file it opens
+the file, exactly as `Enter` does. `h` moves to the parent of the directory being
+shown, the same move as `Enter` on the `..` row, and leaves the cursor on the
+directory just left so that `h` and `l` retrace each other's steps.
 
 Unlike yazi, `d` cuts and `D` deletes rather than `x` cutting and `d` trashing:
 there is no trash to send an entry to, so the shifted key takes the operation

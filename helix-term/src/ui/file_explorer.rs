@@ -30,6 +30,17 @@ type FileExplorer = Picker<ExplorerItem, ExplorerData>;
 
 type KeyHandler = PickerKeyHandler<ExplorerItem, ExplorerData>;
 
+/// Where to leave the cursor in a freshly built explorer.
+enum ExplorerCursor {
+    /// On this row, clamped to the last one. Used when rereading a directory
+    /// after a file operation, to put the cursor back where it was.
+    Row(u32),
+    /// On the entry holding this path, when it is there. Used when moving up the
+    /// tree: which row the directory being left sits on is not known until the
+    /// parent has been read.
+    Entry(PathBuf),
+}
+
 /// The outcome of a file operation: `Ok` is reported as a status message, `Err`
 /// as an error. `None` means the operation reported nothing itself, either
 /// because it was cancelled or because it deferred to a follow-up prompt.
@@ -202,17 +213,29 @@ fn create_file_operation_prompt<F>(
     cx.jobs.callback(callback);
 }
 
-/// Rereads `root` and replaces the open explorer with the result, so that a
-/// completed file operation becomes visible. The cursor is restored to `cursor`
-/// and the picker reopens in `mode`.
+/// Reads `root` and replaces the open explorer with the result, so that a
+/// completed file operation becomes visible, or so that the explorer moves to
+/// another directory. The cursor lands on row `cursor` and the picker reopens in
+/// `picker_mode`.
 fn refresh_file_explorer(cursor: u32, picker_mode: PickerMode, cx: &mut Context, root: PathBuf) {
+    open_file_explorer(ExplorerCursor::Row(cursor), picker_mode, cx, root)
+}
+
+/// The general form of [`refresh_file_explorer`], for when the row to land on is
+/// only known once `root` has been read.
+fn open_file_explorer(
+    cursor: ExplorerCursor,
+    picker_mode: PickerMode,
+    cx: &mut Context,
+    root: PathBuf,
+) {
     let callback = Box::pin(async move {
         let call: Callback = Callback::EditorCompositor(Box::new(move |editor, compositor| {
             // Replace the old file explorer with a new one. `remove` is used
             // rather than `pop` so that only the picker is ever removed;
             // `Overlay` forwards the picker's id.
             compositor.remove(picker::ID);
-            if let Ok(picker) = file_explorer_with_mode(Some(cursor), picker_mode, root, editor) {
+            if let Ok(picker) = file_explorer_with_mode(cursor, picker_mode, root, editor) {
                 compositor.push(Box::new(overlay::overlaid(picker)));
             }
         }));
@@ -243,6 +266,32 @@ pub(super) fn yank_selected_path(cx: &mut Context, op: FileOperation<'_>) {
         Ok(()) => cx.editor.set_status(message),
         Err(err) => cx.editor.set_error(err.to_string()),
     }
+}
+
+/// Moves the explorer to the parent of the directory it is showing: the `h` of
+/// yazi's `h`/`l` tree navigation, and the same move as pressing `Enter` on the
+/// `..` row.
+///
+/// The cursor lands on the directory just left, so that `h` and `l` retrace each
+/// other's steps.
+pub(super) fn parent_directory(cx: &mut Context, op: FileOperation<'_>) {
+    let FileOperation {
+        root, picker_mode, ..
+    } = op;
+
+    // Spelled the way the `..` row is, so that the two agree about where up is.
+    let parent = helix_stdx::path::normalize(root.join(".."));
+    if parent == root {
+        cx.editor
+            .set_status("Already at the root of the filesystem");
+        return;
+    }
+
+    // Handed over as a path rather than resolved to a row here: the parent has to
+    // be read to find the row, and the rebuild is about to read it anyway. That
+    // matters — a directory with thousands of entries takes a noticeable moment
+    // to walk, and walking it twice per keypress would be felt.
+    open_file_explorer(ExplorerCursor::Entry(root), picker_mode, cx, parent);
 }
 
 /// Creates a new file, or a directory when the typed name ends with a path
@@ -807,7 +856,12 @@ pub fn file_explorer(
     root: PathBuf,
     editor: &Editor,
 ) -> Result<FileExplorer, std::io::Error> {
-    file_explorer_with_mode(cursor, PickerMode::default(), root, editor)
+    file_explorer_with_mode(
+        ExplorerCursor::Row(cursor.unwrap_or_default()),
+        PickerMode::default(),
+        root,
+        editor,
+    )
 }
 
 /// As [`file_explorer`], but opening in `mode`.
@@ -819,7 +873,7 @@ pub fn file_explorer(
 /// the query without having asked to be — so the mode is carried across the
 /// rebuild.
 fn file_explorer_with_mode(
-    cursor: Option<u32>,
+    cursor: ExplorerCursor,
     mode: PickerMode,
     root: PathBuf,
     editor: &Editor,
@@ -827,11 +881,23 @@ fn file_explorer_with_mode(
     let directory_style = editor.theme.get("ui.text.directory");
     let directory_content = directory_content(&root, editor)?;
 
-    // The contents may have shrunk since the cursor was captured, for instance
-    // because the user just deleted the last entry.
-    let cursor = cursor
-        .unwrap_or_default()
-        .min(directory_content.len().saturating_sub(1) as u32);
+    let last_row = directory_content.len().saturating_sub(1) as u32;
+    let cursor = match cursor {
+        // The contents may have shrunk since the row was captured, for instance
+        // because the user just deleted the last entry.
+        ExplorerCursor::Row(row) => row.min(last_row),
+        // `flatten_dirs` collapses a chain of single-child directories into one
+        // row, so the row for the directory being left may name a path above or
+        // below it rather than exactly it. Matching on either containing the
+        // other covers both; `Path::starts_with` works a component at a time, so
+        // it cannot confuse `foo` with a sibling `foobar`.
+        ExplorerCursor::Entry(entry) => directory_content
+            .iter()
+            .position(|(path, is_dir)| {
+                *is_dir && (entry.starts_with(path) || path.starts_with(&entry))
+            })
+            .unwrap_or_default() as u32,
+    };
 
     let columns = [PickerColumn::new(
         "path",
@@ -860,11 +926,12 @@ fn file_explorer_with_mode(
             if *is_dir {
                 let new_root = helix_stdx::path::normalize(path);
                 let mode = descend_mode.get();
+                let cursor = ExplorerCursor::Row(0);
                 let callback = Box::pin(async move {
                     let call: Callback =
                         Callback::EditorCompositor(Box::new(move |editor, compositor| {
                             if let Ok(picker) =
-                                file_explorer_with_mode(None, mode, new_root, editor)
+                                file_explorer_with_mode(cursor, mode, new_root, editor)
                             {
                                 compositor.push(Box::new(overlay::overlaid(picker)));
                             }
@@ -911,6 +978,7 @@ fn file_explorer_with_mode(
     // `a` shadows one of the picker's three ways into insert mode; `i` and `/`
     // still get to the query.
     .with_modal_key_handlers(hashmap! {
+        key!('h') => file_operation_key(parent_directory),
         key!('a') => file_operation_key(create_file_or_directory),
         key!('r') => file_operation_key(rename_selected),
         key!('m') => file_operation_key(move_selected),
