@@ -48,6 +48,7 @@ use helix_core::{
 use helix_view::{
     editor::Action,
     graphics::{CursorKind, Margin, Modifier, Rect},
+    input::KeyEvent,
     media::{GraphicsMode, MediaKind, MediaState},
     theme::Style,
     view::ViewPosition,
@@ -308,6 +309,9 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
 
     callback_fn: PickerCallback<T>,
     default_action: Action,
+    /// Extra key bindings, checked before the picker's own key handling.
+    /// See [`Picker::with_key_handlers`].
+    key_handlers: PickerKeyHandlers<T, D>,
 
     pub truncate_start: bool,
     /// Caches paths to documents
@@ -453,6 +457,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             show_preview: true,
             callback_fn: Box::new(callback_fn),
             default_action: Action::Replace,
+            key_handlers: HashMap::new(),
             completion_height: 0,
             widths,
             preview_cache: HashMap::new(),
@@ -503,6 +508,54 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     pub fn with_initial_cursor(mut self, cursor: u32) -> Self {
         self.cursor = cursor;
         self
+    }
+
+    /// Adds extra key bindings to the picker.
+    ///
+    /// The handlers are consulted before the picker's own key handling and before
+    /// the embedded prompt sees the key, so a handler may shadow a built-in
+    /// binding. A handler only runs when the picker has a selection; otherwise the
+    /// key falls through to the normal handling.
+    ///
+    /// Prefer keys that the picker and its prompt do not already use. Notably
+    /// taken are `Alt-Enter`, `Alt-b`, `Alt-d`, `Alt-f`, `Alt-Backspace`,
+    /// `Alt-Delete`, `Ctrl-u`, `Ctrl-d`, `PageUp` and `PageDown`.
+    ///
+    /// ```ignore
+    /// let picker = Picker::new(columns, 0, options, data, callback)
+    ///     .with_key_handlers(hashmap! {
+    ///         alt!('y') => Box::new(|cx, args: PickerAction<'_, MyItem, MyData>| {
+    ///             cx.editor.set_status(args.selection.to_string());
+    ///         }) as PickerKeyHandler<MyItem, MyData>,
+    ///     });
+    /// ```
+    pub fn with_key_handlers(mut self, handlers: PickerKeyHandlers<T, D>) -> Self {
+        self.key_handlers = handlers;
+        self
+    }
+
+    /// Runs the [`Picker::with_key_handlers`] handler bound to `event`, if any.
+    ///
+    /// Returns `true` when a handler ran and the key should not be handled any
+    /// further.
+    fn handle_custom_key(&self, event: &KeyEvent, cx: &mut Context) -> bool {
+        let Some(handler) = self.key_handlers.get(event) else {
+            return false;
+        };
+        let Some(selection) = self.selection() else {
+            return false;
+        };
+
+        handler(
+            cx,
+            PickerAction {
+                selection,
+                data: Arc::clone(&self.editor_data),
+                cursor: self.cursor,
+            },
+        );
+
+        true
     }
 
     pub fn with_dynamic_query(
@@ -1539,6 +1592,12 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             EventResult::Consumed(Some(callback))
         };
 
+        // Extra key bindings supplied by the picker's creator take precedence over
+        // the built-in ones.
+        if self.handle_custom_key(&key_event, ctx) {
+            return EventResult::Consumed(None);
+        }
+
         match key_event {
             shift!(Tab) | key!(Up) | ctrl!('p') => {
                 self.move_by(1, Direction::Backward);
@@ -1685,3 +1744,23 @@ impl<T: 'static + Send + Sync, D> Drop for Picker<T, D> {
 }
 
 type PickerCallback<T> = Box<dyn Fn(&mut Context, &T, Action)>;
+
+/// The picker state handed to a [`PickerKeyHandler`] when its key is pressed.
+pub struct PickerAction<'a, T, D> {
+    /// The item currently under the picker's cursor.
+    pub selection: &'a T,
+    /// The data shared by every item of the picker, as passed to
+    /// [`Picker::new`].
+    pub data: Arc<D>,
+    /// The index of the picker's cursor within the current matches. Pass it to
+    /// [`Picker::with_initial_cursor`] to reopen the picker where the user left
+    /// it.
+    pub cursor: u32,
+}
+
+/// A handler for one of the extra keys registered with
+/// [`Picker::with_key_handlers`].
+pub type PickerKeyHandler<T, D> = Box<dyn Fn(&mut Context, PickerAction<'_, T, D>)>;
+
+/// The extra key bindings of a picker, keyed by the key event that triggers them.
+pub type PickerKeyHandlers<T, D> = HashMap<KeyEvent, PickerKeyHandler<T, D>>;
