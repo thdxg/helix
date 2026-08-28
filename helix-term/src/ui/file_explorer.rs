@@ -970,13 +970,21 @@ fn file_explorer_with_mode(
                     Ok(call)
                 });
                 cx.jobs.callback(callback);
-            } else if let Err(e) = cx.editor.open(path, action) {
-                let err = if let Some(err) = e.source() {
-                    format!("{}", err)
-                } else {
-                    format!("unable to open \"{}\"", path.display())
-                };
-                cx.editor.set_error(err);
+            } else {
+                #[cfg(feature = "steel")]
+                if crate::commands::engine::steel::dispatch_file_picker_open_handler(
+                    cx, path, action,
+                ) {
+                    return;
+                }
+                if let Err(e) = cx.editor.open(path, action) {
+                    let err = if let Some(err) = e.source() {
+                        format!("{}", err)
+                    } else {
+                        format!("unable to open \"{}\"", path.display())
+                    };
+                    cx.editor.set_error(err);
+                }
             }
         },
     )
