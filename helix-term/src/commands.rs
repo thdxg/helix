@@ -804,6 +804,46 @@ pub(crate) fn media_page_move(cx: &mut Context, forward: bool) -> bool {
     true
 }
 
+/// If the focused document is a media document, the goto-line keys jump
+/// straight to a page instead of moving a cursor: `<count>gg` and `<count>G`
+/// go to page `count`, `gg` to the first page and `ge` (`page` = None) to the
+/// last. A page past the end clamps to the last one, the way `<count>gg`
+/// clamps to the last line of a text buffer. Returns true when the key was
+/// handled here.
+fn media_page_goto(cx: &mut Context, page: Option<usize>) -> bool {
+    let doc = doc_mut!(cx.editor);
+    let Some(media) = doc.media.as_mut() else {
+        return false;
+    };
+    if media.kind != helix_view::media::MediaKind::Pdf {
+        // Images have no pages; swallow the key so it can't edit the buffer.
+        return true;
+    }
+    let target = match (page, media.page_count) {
+        (Some(page), Some(count)) => page.min(count.saturating_sub(1)),
+        // Without `pdfinfo` there is nothing to clamp against: rasterizing
+        // reports a page past the end and falls back (see `finish_raster`).
+        (Some(page), None) => page,
+        (None, Some(count)) => count.saturating_sub(1),
+        (None, None) => {
+            cx.editor
+                .set_error("cannot go to the last page: page count unknown");
+            return true;
+        }
+    };
+    let status = match media.goto_page(target) {
+        Ok(()) => match media.page_count {
+            Some(count) => format!("page {}/{}", target + 1, count),
+            None => format!("page {}", target + 1),
+        },
+        // Only a document `pdfinfo` reports as empty gets here; clamping keeps
+        // every other known page in range.
+        Err(err) => err.to_string(),
+    };
+    cx.editor.set_status(status);
+    true
+}
+
 fn move_char_left(cx: &mut Context) {
     if media_page_move(cx, false) {
         return;
@@ -1375,6 +1415,10 @@ fn goto_file_start_impl(cx: &mut Context, movement: Movement) {
     if cx.count.is_some() {
         goto_line_impl(cx, movement);
     } else {
+        // `gg`: first page on media documents (see media_page_goto).
+        if media_page_goto(cx, Some(0)) {
+            return;
+        }
         let (view, doc) = current!(cx.editor);
         let text = doc.text().slice(..);
         let selection = doc
@@ -4197,7 +4241,12 @@ fn goto_line(cx: &mut Context) {
 }
 
 fn goto_line_impl(cx: &mut Context, movement: Movement) {
-    if cx.count.is_some() {
+    if let Some(count) = cx.count {
+        // `<count>G`/`<count>gg`: page N on media documents (see
+        // media_page_goto).
+        if media_page_goto(cx, Some(count.get() - 1)) {
+            return;
+        }
         let (view, doc) = current!(cx.editor);
         push_jump(view, doc);
 
@@ -4239,6 +4288,10 @@ fn extend_to_last_line(cx: &mut Context) {
 }
 
 fn goto_last_line_impl(cx: &mut Context, movement: Movement) {
+    // `ge`: last page on media documents (see media_page_goto).
+    if media_page_goto(cx, None) {
+        return;
+    }
     let (view, doc) = current!(cx.editor);
     let text = doc.text().slice(..);
     let line_idx = if text.line(text.len_lines() - 1).len_chars() == 0 {
