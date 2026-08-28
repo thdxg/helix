@@ -2023,7 +2023,10 @@ impl Component for EditorView {
     }
 }
 
-fn canonicalize_key(key: &mut KeyEvent) {
+/// Drops the `Shift` modifier from a character key, so that a terminal which
+/// reports `G` as `Shift-G` (as the Kitty keyboard protocol does) matches the
+/// same binding as one which reports it as a bare `G`.
+pub(crate) fn canonicalize_key(key: &mut KeyEvent) {
     if let KeyEvent {
         code: KeyCode::Char(_),
         modifiers: _,

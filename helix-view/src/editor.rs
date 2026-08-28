@@ -438,6 +438,9 @@ pub struct Config {
 
     pub buffer_picker: BufferPickerConfig,
 
+    /// Behaviour shared by every picker.
+    pub picker: PickerConfig,
+
     pub auto_reload: AutoReloadConfig,
     pub file_watcher: file_watcher::Config,
 
@@ -531,6 +534,16 @@ impl Config {
 #[serde(rename_all = "kebab-case")]
 pub struct BufferPickerConfig {
     pub start_position: PickerStartPosition,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, Clone, Copy)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct PickerConfig {
+    /// Whether pickers support modal editing: `Esc` leaves the query and enters
+    /// a normal mode where unmodified keys drive the picker instead of typing
+    /// into the query. Defaults to `false`, in which case `Esc` closes the
+    /// picker as it always has.
+    pub modal: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, Clone, Copy)]
@@ -1301,6 +1314,7 @@ impl Default for Config {
             kitty_keyboard_protocol: Default::default(),
             image_rendering: Default::default(),
             buffer_picker: BufferPickerConfig::default(),
+            picker: PickerConfig::default(),
             #[cfg(feature = "steel")]
             enable_steel: true,
             #[cfg(not(feature = "steel"))]
