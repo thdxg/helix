@@ -3477,7 +3477,7 @@ fn file_explorer(cx: &mut Context) {
         return;
     }
 
-    if let Ok(picker) = ui::file_explorer(None, root, cx.editor) {
+    if let Ok(picker) = ui::file_explorer(root, cx.editor) {
         cx.push_layer(Box::new(overlaid(picker)));
     }
 }
@@ -3504,7 +3504,7 @@ fn file_explorer_in_current_buffer_directory(cx: &mut Context) {
         }
     };
 
-    if let Ok(picker) = ui::file_explorer(None, path, cx.editor) {
+    if let Ok(picker) = ui::file_explorer(path, cx.editor) {
         cx.push_layer(Box::new(overlaid(picker)));
     }
 }
@@ -3517,7 +3517,7 @@ fn file_explorer_in_current_directory(cx: &mut Context) {
         return;
     }
 
-    if let Ok(picker) = ui::file_explorer(None, cwd, cx.editor) {
+    if let Ok(picker) = ui::file_explorer(cwd, cx.editor) {
         cx.push_layer(Box::new(overlaid(picker)));
     }
 }

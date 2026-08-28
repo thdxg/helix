@@ -35,9 +35,10 @@ enum ExplorerCursor {
     /// On this row, clamped to the last one. Used when rereading a directory
     /// after a file operation, to put the cursor back where it was.
     Row(u32),
-    /// On the entry holding this path, when it is there. Used when moving up the
-    /// tree: which row the directory being left sits on is not known until the
-    /// parent has been read.
+    /// On the entry holding this path, when it is there, and on the first row
+    /// when it is not. Used when moving up the tree — which row the directory
+    /// being left sits on is not known until the parent has been read — and when
+    /// opening the explorer on the current buffer.
     Entry(PathBuf),
 }
 
@@ -878,21 +879,49 @@ fn file_operation_key(operation: fn(&mut Context, FileOperation<'_>)) -> KeyHand
     )
 }
 
+/// Resolves where the cursor of a freshly built explorer goes, given the rows
+/// it was built over.
+fn cursor_row(cursor: ExplorerCursor, directory_content: &[ExplorerItem]) -> u32 {
+    let last_row = directory_content.len().saturating_sub(1) as u32;
+
+    match cursor {
+        // The contents may have shrunk since the row was captured, for instance
+        // because the user just deleted the last entry.
+        ExplorerCursor::Row(row) => row.min(last_row),
+        // A row holds the entry when it names the entry itself — a file the
+        // explorer lists directly — or a directory the entry lives under, which
+        // is how a buffer nested deeper than one level is found.
+        //
+        // The other direction is for moving up the tree: `flatten_dirs`
+        // collapses a chain of single-child directories into one row, so the row
+        // for the directory being left may name a path below it rather than
+        // exactly it. `Path::starts_with` works a component at a time, so
+        // neither test can confuse `foo` with a sibling `foobar`.
+        //
+        // The first row, `..`, never matches: no path under the root starts with
+        // it, and it starts with nothing but itself.
+        ExplorerCursor::Entry(entry) => directory_content
+            .iter()
+            .position(|(path, is_dir)| {
+                entry.starts_with(path) || (*is_dir && path.starts_with(&entry))
+            })
+            .unwrap_or_default() as u32,
+    }
+}
+
 /// Builds the file explorer picker rooted at `root`.
 ///
-/// `cursor` restores the position of the picker's cursor, for when the explorer
-/// is reopened after a file operation.
-pub fn file_explorer(
-    cursor: Option<u32>,
-    root: PathBuf,
-    editor: &Editor,
-) -> Result<FileExplorer, std::io::Error> {
-    file_explorer_with_mode(
-        ExplorerCursor::Row(cursor.unwrap_or_default()),
-        None,
-        root,
-        editor,
-    )
+/// The cursor lands on the entry holding the current buffer — the buffer's own
+/// row when the explorer lists it, the directory it lives under otherwise — so
+/// that the explorer opens where the user already is. A scratch buffer, or one
+/// outside `root`, leaves the cursor on the first row.
+pub fn file_explorer(root: PathBuf, editor: &Editor) -> Result<FileExplorer, std::io::Error> {
+    let cursor = match doc!(editor).path() {
+        Some(path) => ExplorerCursor::Entry(path.to_path_buf()),
+        None => ExplorerCursor::Row(0),
+    };
+
+    file_explorer_with_mode(cursor, None, root, editor)
 }
 
 /// As [`file_explorer`], but opening in `mode`, or in the configured default
@@ -913,23 +942,7 @@ fn file_explorer_with_mode(
     let directory_style = editor.theme.get("ui.text.directory");
     let directory_content = directory_content(&root, editor)?;
 
-    let last_row = directory_content.len().saturating_sub(1) as u32;
-    let cursor = match cursor {
-        // The contents may have shrunk since the row was captured, for instance
-        // because the user just deleted the last entry.
-        ExplorerCursor::Row(row) => row.min(last_row),
-        // `flatten_dirs` collapses a chain of single-child directories into one
-        // row, so the row for the directory being left may name a path above or
-        // below it rather than exactly it. Matching on either containing the
-        // other covers both; `Path::starts_with` works a component at a time, so
-        // it cannot confuse `foo` with a sibling `foobar`.
-        ExplorerCursor::Entry(entry) => directory_content
-            .iter()
-            .position(|(path, is_dir)| {
-                *is_dir && (entry.starts_with(path) || path.starts_with(&entry))
-            })
-            .unwrap_or_default() as u32,
-    };
+    let cursor = cursor_row(cursor, &directory_content);
 
     let columns = [PickerColumn::new(
         "path",
@@ -1055,6 +1068,53 @@ mod test {
         assert!(check_within_root(root, Path::new("/home/user/project/../other")).is_err());
         // A sibling whose name merely starts with the root's name is outside it.
         assert!(check_within_root(root, Path::new("/home/user/project2/src")).is_err());
+    }
+
+    /// The rows of an explorer showing `/home/user/project`, in the order
+    /// `directory_content` builds them: `..` first, then directories, then
+    /// files. `src/main.rs` stands for a directory flattened past its single
+    /// child.
+    fn test_rows() -> Vec<ExplorerItem> {
+        [
+            ("/home/user/project/..", true),
+            ("/home/user/project/src", true),
+            ("/home/user/project/target/debug", true),
+            ("/home/user/project/Cargo.toml", false),
+            ("/home/user/project/README.md", false),
+        ]
+        .into_iter()
+        .map(|(path, is_dir)| (PathBuf::from(path), is_dir))
+        .collect()
+    }
+
+    #[test]
+    fn test_cursor_row() {
+        let rows = test_rows();
+        let row_for = |path: &str| cursor_row(ExplorerCursor::Entry(PathBuf::from(path)), &rows);
+
+        // A row is kept as it is, but never past the last one: entries may have
+        // been deleted since the row was captured.
+        assert_eq!(cursor_row(ExplorerCursor::Row(3), &rows), 3);
+        assert_eq!(cursor_row(ExplorerCursor::Row(99), &rows), 4);
+        assert_eq!(cursor_row(ExplorerCursor::Row(0), &[]), 0);
+
+        // A file the explorer lists is found on its own row.
+        assert_eq!(row_for("/home/user/project/README.md"), 4);
+        // One nested deeper is found on the directory holding it, whether the
+        // row names that directory exactly or a flattened path below it.
+        assert_eq!(row_for("/home/user/project/src/ui/picker.rs"), 1);
+        assert_eq!(row_for("/home/user/project/target/debug/hx"), 2);
+        // A directory being left is found even when the row for it was
+        // flattened past it.
+        assert_eq!(row_for("/home/user/project/target"), 2);
+
+        // Anything the explorer is not showing leaves the cursor at the top,
+        // including the parent of the root: the `..` row is never landed on by
+        // name.
+        assert_eq!(row_for("/home/user/other/main.rs"), 0);
+        assert_eq!(row_for("/home/user"), 0);
+        // Nor is a sibling whose name merely starts with a listed one.
+        assert_eq!(row_for("/home/user/project/src2/main.rs"), 0);
     }
 
     #[test]
