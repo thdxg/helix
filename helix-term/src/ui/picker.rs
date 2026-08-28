@@ -42,7 +42,8 @@ use std::{
 use crate::ui::{Prompt, PromptEvent};
 use helix_core::{
     char_idx_at_visual_offset, fuzzy::MATCHER, movement::Direction,
-    text_annotations::TextAnnotations, unicode::segmentation::UnicodeSegmentation, Position,
+    text_annotations::TextAnnotations, unicode::segmentation::UnicodeSegmentation,
+    visual_offset_from_anchor, Position,
 };
 use helix_view::{
     editor::Action,
@@ -54,7 +55,8 @@ use helix_view::{
 };
 
 use self::handlers::{
-    DynamicQueryChange, DynamicQueryHandler, PreviewHighlightHandler, PreviewMediaHandler,
+    spawn_preview_raster, DynamicQueryChange, DynamicQueryHandler, PreviewHighlightHandler,
+    PreviewMediaHandler,
 };
 
 pub const ID: &str = "picker";
@@ -165,6 +167,15 @@ impl Preview<'_, '_> {
             },
         }
     }
+}
+
+/// Where the [`MediaState`] behind a media preview lives, so that the picker
+/// can page it. A media file already open in the editor keeps its state on the
+/// document (and so shares the page with the editor's own view of it);
+/// otherwise the picker owns it in its preview cache.
+enum MediaTarget {
+    Document(DocumentId),
+    Cached(Arc<Path>),
 }
 
 fn inject_nucleo_item<T, D>(
@@ -309,6 +320,21 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     /// An event handler for rasterizing the currently previewed image or PDF.
     preview_media_handler: Sender<Arc<Path>>,
     dynamic_query_handler: Option<Sender<DynamicQueryChange>>,
+
+    /// Vertical scroll of the preview relative to its natural top. Positive
+    /// scrolls down, negative up. Counted in visual (soft-wrapped) rows for a
+    /// document preview and in placement rows for a panned image; a PDF pages
+    /// instead of scrolling, so this stays zero for one.
+    preview_scroll_offset: isize,
+    /// Height in rows of the preview pane's inner area, used for page scrolling.
+    preview_height: u16,
+    /// Selected item the current `preview_scroll_offset` applies to; the scroll
+    /// resets to the top when the selection changes.
+    preview_scroll_cursor: u32,
+    /// Whether the last frame actually drew a preview. Preview-scroll keys fall
+    /// back to result-list navigation when it did not, so `PageUp`/`PageDown`
+    /// keep paging the list in a window too narrow for a preview.
+    preview_visible: bool,
 }
 
 impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
@@ -435,6 +461,10 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             preview_highlight_handler: PreviewHighlightHandler::<T, D>::default().spawn(),
             preview_media_handler: PreviewMediaHandler::<T, D>::default().spawn(),
             dynamic_query_handler: None,
+            preview_scroll_offset: 0,
+            preview_height: 0,
+            preview_scroll_cursor: 0,
+            preview_visible: false,
         }
     }
 
@@ -494,6 +524,146 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     pub fn with_default_action(mut self, action: Action) -> Self {
         self.default_action = action;
         self
+    }
+
+    /// Whether a scrollable preview is currently shown. Pickers without a
+    /// preview callback (no `file_fn`), with the preview toggled off, or too
+    /// narrow to fit one route preview-scroll keys back to result-list
+    /// navigation.
+    fn preview_shown(&self) -> bool {
+        self.show_preview && self.file_fn.is_some() && self.preview_visible
+    }
+
+    /// Scroll the preview by `amount` rows, down for a positive amount and up
+    /// for a negative one.
+    ///
+    /// A document preview scrolls by visual (soft-wrapped) rows, so a file with
+    /// long lines can be read to its end one wrapped row at a time; the offset
+    /// is clamped against the file bounds later, when the preview is rendered
+    /// and the soft-wrap layout is known. An image pans by placement rows,
+    /// clamped against the placement when it is drawn. A PDF pages instead:
+    /// every scroll key turns exactly one page, like `gj`/`gk` and the mouse
+    /// wheel do in a media view.
+    fn scroll_preview(&mut self, amount: isize, editor: &mut Editor) {
+        match self.selected_media(editor) {
+            Some((target, MediaKind::Pdf)) => self.page_media(editor, &target, amount.signum()),
+            // Clamped at the top here and at the bottom of the placement when
+            // the image is drawn, so overscroll can't accumulate in either
+            // direction.
+            Some((_, MediaKind::Image)) => {
+                self.preview_scroll_offset =
+                    self.preview_scroll_offset.saturating_add(amount).max(0)
+            }
+            None => self.preview_scroll_offset = self.preview_scroll_offset.saturating_add(amount),
+        }
+    }
+
+    /// Scroll the preview down one line (`scroll-lines` rows of it).
+    pub fn scroll_preview_line_down(&mut self, editor: &mut Editor) {
+        let lines = editor.config().scroll_lines.unsigned_abs() as isize;
+        self.scroll_preview(lines, editor);
+    }
+
+    /// Scroll the preview up one line (`scroll-lines` rows of it).
+    pub fn scroll_preview_line_up(&mut self, editor: &mut Editor) {
+        let lines = editor.config().scroll_lines.unsigned_abs() as isize;
+        self.scroll_preview(-lines, editor);
+    }
+
+    /// Scroll the preview down by the height of the preview pane.
+    pub fn scroll_preview_page_down(&mut self, editor: &mut Editor) {
+        self.scroll_preview(self.preview_height as isize, editor);
+    }
+
+    /// Scroll the preview up by the height of the preview pane.
+    pub fn scroll_preview_page_up(&mut self, editor: &mut Editor) {
+        self.scroll_preview(-(self.preview_height as isize), editor);
+    }
+
+    /// Where the media state of the currently selected preview lives, and what
+    /// kind of media it is. `None` when the selection has no preview or its
+    /// preview is not a rasterized image or PDF (including one that has not
+    /// finished rasterizing yet, which has no page to turn).
+    fn selected_media(&self, editor: &Editor) -> Option<(MediaTarget, MediaKind)> {
+        let current = self.selection()?;
+        let (path_or_id, _) = (self.file_fn.as_ref()?)(editor, current)?;
+
+        let id = match path_or_id {
+            PathOrId::Id(id) => id,
+            PathOrId::Path(path) => match editor.document_by_path(path) {
+                Some(doc) => doc.id(),
+                None => {
+                    // NOTE: `get_key_value` rather than indexing, to get an
+                    // owned key that outlives the borrow of `path`.
+                    let (path, preview) = self.preview_cache.get_key_value(path)?;
+                    let CachedPreview::Media(MediaPreview::Ready(media)) = preview else {
+                        return None;
+                    };
+                    return Some((MediaTarget::Cached(path.clone()), media.kind));
+                }
+            },
+        };
+        let kind = editor.documents.get(&id)?.media.as_ref()?.kind;
+        Some((MediaTarget::Document(id), kind))
+    }
+
+    fn media_state_mut<'a>(
+        preview_cache: &'a mut HashMap<Arc<Path>, CachedPreview>,
+        editor: &'a mut Editor,
+        target: &MediaTarget,
+    ) -> Option<&'a mut MediaState> {
+        match target {
+            MediaTarget::Document(id) => editor.documents.get_mut(id)?.media.as_mut(),
+            MediaTarget::Cached(path) => match preview_cache.get_mut(path)? {
+                CachedPreview::Media(MediaPreview::Ready(media)) => Some(media),
+                _ => None,
+            },
+        }
+    }
+
+    /// Turn a PDF preview by `pages`, clamped to the document. Paging only
+    /// moves a counter; the page it lands on is rasterized off the main thread
+    /// by `request_media_raster` on the next frame, so holding the key neither
+    /// blocks the picker nor renders pages that go by on the way.
+    fn page_media(&mut self, editor: &mut Editor, target: &MediaTarget, pages: isize) {
+        let Some(media) = Self::media_state_mut(&mut self.preview_cache, editor, target) else {
+            return;
+        };
+        let mut page = (media.page as isize).saturating_add(pages).max(0) as usize;
+        if let Some(count) = media.page_count {
+            page = page.min(count.saturating_sub(1));
+        }
+        if page == media.page {
+            // Stay quiet at either end of the document.
+            return;
+        }
+        if let Err(err) = media.goto_page(page) {
+            // Unknown page count (no `pdfinfo`): paging past the end fails.
+            editor.set_error(err.to_string());
+        }
+    }
+
+    /// Kick off the rasterize for a PDF preview that has been paged, if one is
+    /// outstanding and none is already running. Called every frame, as the
+    /// editor's media view does, so the page landed on is picked up even when
+    /// several pages went by while a rasterize was in flight.
+    fn request_media_raster(&mut self, editor: &mut Editor) {
+        if editor.graphics.mode == GraphicsMode::None {
+            return;
+        }
+        let Some((target, MediaKind::Pdf)) = self.selected_media(editor) else {
+            return;
+        };
+        let Some(media) = Self::media_state_mut(&mut self.preview_cache, editor, &target) else {
+            return;
+        };
+        let Some(request) = media.take_raster_request() else {
+            return;
+        };
+        match target {
+            MediaTarget::Document(id) => EditorView::spawn_raster(id, request),
+            MediaTarget::Cached(path) => spawn_preview_raster::<T, D>(path, request),
+        }
     }
 
     /// Move the cursor by a number of lines, either down (`Forward`) or up (`Backward`)
@@ -967,6 +1137,22 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         let inner = inner.inner(margin);
         BLOCK.render(area, surface);
 
+        // Reset the preview scroll on a selection change, before the
+        // `get_preview` borrow below.
+        if self.cursor != self.preview_scroll_cursor {
+            self.preview_scroll_offset = 0;
+            self.preview_scroll_cursor = self.cursor;
+        }
+
+        // Pick up the rasterize for a PDF preview that has been paged. Must
+        // happen before `get_preview` borrows the editor.
+        self.request_media_raster(cx.editor);
+
+        // `get_preview` borrows `self` for the block below, so the offset is
+        // read into a local here, clamped against the layout inside, then
+        // written back after.
+        let mut scroll = self.preview_scroll_offset;
+
         if let Some((preview, range)) = self.get_preview(cx.editor) {
             // Images and PDFs are drawn as a graphics placement rather than as
             // text. Everything needed is copied out of the preview so that the
@@ -977,30 +1163,59 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                     media.kind,
                     media.page,
                     media.page_count,
+                    media.is_rastering(),
                 )
             });
-            if let Some((raster, kind, page, page_count)) = media {
+            if let Some((raster, kind, page, page_count, rastering)) = media {
                 let caption = match kind {
-                    MediaKind::Pdf => match page_count {
-                        Some(count) => format!("page {}/{}", page + 1, count),
-                        None => format!("page {}", page + 1),
-                    },
+                    MediaKind::Pdf => {
+                        let mut caption = match page_count {
+                            Some(count) => format!("page {}/{}", page + 1, count),
+                            None => format!("page {}", page + 1),
+                        };
+                        // The image below the caption is still the previous page.
+                        if rastering {
+                            caption.push_str(" \u{2026}");
+                        }
+                        caption
+                    }
                     MediaKind::Image => format!("{}\u{00d7}{}", raster.width, raster.height),
                 };
                 // The last line is left for the caption.
                 let image_area = inner.clip_bottom(1);
-                let placement = ui::media::draw_raster(
+                // Only images pan; a PDF turns pages instead and is always
+                // drawn whole.
+                let pan = if kind == MediaKind::Image {
+                    scroll.clamp(0, u16::MAX as isize) as u16
+                } else {
+                    0
+                };
+                let placement = ui::media::draw_raster_panned(
                     surface,
                     &mut cx.editor.graphics,
                     image_area,
                     &raster,
                     kind == MediaKind::Pdf,
+                    pan,
                 );
                 let comment = cx.editor.theme.get("comment");
                 if let Some(placement) = placement {
+                    // Clamp the stored offset against the placement, so
+                    // panning can't run off the bottom of the image and
+                    // accumulate: the next scroll up then responds at once.
+                    self.preview_scroll_offset = pan.min(placement.max_pan) as isize;
+                    let mut caption = caption;
+                    if placement.max_pan > 0 {
+                        // Where the visible window sits in the panned image.
+                        caption.push_str(&format!(
+                            " \u{2014} row {}/{}",
+                            pan.min(placement.max_pan) + 1,
+                            placement.max_pan + placement.area.height
+                        ));
+                    }
                     let x =
                         inner.x + inner.width.saturating_sub(ui::media::text_width(&caption)) / 2;
-                    let y = placement.y + placement.height;
+                    let y = placement.area.y + placement.area.height;
                     surface.set_stringn(x, y, &caption, inner.width as usize, comment);
                 } else if cx.editor.graphics.mode == GraphicsMode::None {
                     // A media document open in the editor can reach here with
@@ -1046,6 +1261,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                     return;
                 }
             };
+            let doc_height = doc.text().len_lines();
 
             let mut offset = ViewPosition::default();
             if let Some((start_line, end_line)) = range {
@@ -1071,6 +1287,86 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                     }
                 } else {
                     offset.anchor = start;
+                }
+            }
+
+            // Apply the preview scroll by moving the anchor by whole visual
+            // lines, so soft-wrapped lines scroll one wrapped row at a time.
+            // `offset.anchor` is the natural top of the preview (line 0, or the
+            // centred match for range previews) and is left untouched when
+            // there is no scroll, keeping that centring. An upward scroll is
+            // clamped to the start of the file by `char_idx_at_visual_offset`.
+            let mut at_bottom = false;
+            if scroll != 0 {
+                let text = doc.text().slice(..);
+                let text_fmt = doc.text_format(inner.width, None);
+                let annotations = TextAnnotations::default();
+                let natural_anchor = offset.anchor;
+
+                let (anchor, vertical_offset) = char_idx_at_visual_offset(
+                    text,
+                    natural_anchor,
+                    scroll,
+                    0,
+                    &text_fmt,
+                    &annotations,
+                );
+
+                // The anchor that keeps the file's last visual line on the
+                // bottom row, so a downward scroll can't run past the end into
+                // empty space. Found by walking up one viewport from the end: a
+                // screenful of rows at most.
+                let (max_anchor, _) = char_idx_at_visual_offset(
+                    text,
+                    text.len_chars().saturating_sub(1),
+                    -(inner.height as isize - 1),
+                    0,
+                    &text_fmt,
+                    &annotations,
+                );
+
+                if anchor >= max_anchor {
+                    at_bottom = true;
+                    offset.anchor = max_anchor;
+                    offset.vertical_offset = 0;
+
+                    // Scrolled past the bottom: clamp the stored offset to the
+                    // scroll that exactly reaches it, so the offset can't
+                    // accumulate and the next upward scroll responds at once.
+                    // Measured between the in-range natural and bottom anchors
+                    // (not the applied anchor, which may sit past EOF where it
+                    // can't be measured), capped at the current offset.
+                    if anchor > max_anchor {
+                        let max_scroll = visual_offset_from_anchor(
+                            text,
+                            natural_anchor,
+                            max_anchor,
+                            &text_fmt,
+                            &annotations,
+                            scroll.unsigned_abs(),
+                        )
+                        .map_or(scroll, |(pos, _)| pos.row as isize);
+                        scroll = scroll.min(max_scroll);
+                    }
+                } else {
+                    offset.anchor = anchor;
+                    offset.vertical_offset = vertical_offset;
+
+                    // Past the top: `char_idx_at_visual_offset` already pinned
+                    // the anchor to the start, so normalise a negative offset
+                    // to the rows actually scrolled, keeping it from
+                    // accumulating above the top.
+                    if scroll < 0 && anchor <= natural_anchor {
+                        scroll = visual_offset_from_anchor(
+                            text,
+                            anchor,
+                            natural_anchor,
+                            &text_fmt,
+                            &annotations,
+                            scroll.unsigned_abs(),
+                        )
+                        .map_or(scroll, |(pos, _)| -(pos.row as isize));
+                    }
                 }
             }
 
@@ -1124,6 +1420,8 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 decorations.add_decoration(draw_highlight);
             }
 
+            let current_line = doc.text().slice(..).char_to_line(offset.anchor);
+
             render_document(
                 surface,
                 inner,
@@ -1136,7 +1434,42 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 &cx.editor.theme,
                 decorations,
             );
+
+            // Scroll indicator on the right edge. The thumb is placed from
+            // document lines, which is approximate when lines soft-wrap, so it
+            // is pinned to the end once the preview is scrolled to the bottom
+            // and otherwise clamped within the track.
+            let win_height = inner.height as usize;
+            let scroll_style = cx.editor.theme.get("ui.menu.scroll");
+
+            if doc_height > win_height {
+                let scroll_height = win_height.pow(2).div_ceil(doc_height).min(win_height);
+                let track = win_height - scroll_height;
+                let scroll_line = if at_bottom {
+                    track
+                } else {
+                    (track * current_line / std::cmp::max(1, doc_height.saturating_sub(win_height)))
+                        .min(track)
+                };
+
+                let mut cell;
+                for i in 0..win_height {
+                    cell = &mut surface[(inner.right() - 1, inner.top() + i as u16)];
+                    cell.set_symbol("▐");
+
+                    if scroll_line <= i && i < scroll_line + scroll_height {
+                        // thumb
+                        cell.set_fg(scroll_style.fg.unwrap_or(helix_view::theme::Color::Reset));
+                    } else {
+                        // track
+                        cell.set_fg(scroll_style.bg.unwrap_or(helix_view::theme::Color::Reset));
+                    }
+                }
+            }
         }
+
+        // Persist the offset clamped against the layout above.
+        self.preview_scroll_offset = scroll;
     }
 }
 
@@ -1151,6 +1484,9 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
 
         let render_preview =
             self.show_preview && self.file_fn.is_some() && area.width > MIN_AREA_WIDTH_FOR_PREVIEW;
+        // Remembered for `preview_shown`, so the preview-scroll keys know
+        // whether there is a preview on screen to scroll.
+        self.preview_visible = render_preview;
 
         let picker_width = if render_preview {
             area.width / 2
@@ -1168,8 +1504,6 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
     }
 
     fn handle_event(&mut self, event: &Event, ctx: &mut Context) -> EventResult {
-        // TODO: keybinds for scrolling preview
-
         let key_event = match event {
             Event::Key(event) => *event,
             Event::Paste(..) => return self.prompt_handle_event(event, ctx),
@@ -1212,10 +1546,25 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             key!(Tab) | key!(Down) | ctrl!('n') => {
                 self.move_by(1, Direction::Forward);
             }
-            key!(PageDown) | ctrl!('d') => {
+            // Ctrl-d/Ctrl-u always page the result list. PageDown/PageUp
+            // scroll the preview a full page when one is shown, and otherwise
+            // page the list.
+            ctrl!('d') => {
                 self.page_down();
             }
-            key!(PageUp) | ctrl!('u') => {
+            ctrl!('u') => {
+                self.page_up();
+            }
+            key!(PageDown) if self.preview_shown() => {
+                self.scroll_preview_page_down(ctx.editor);
+            }
+            key!(PageUp) if self.preview_shown() => {
+                self.scroll_preview_page_up(ctx.editor);
+            }
+            key!(PageDown) => {
+                self.page_down();
+            }
+            key!(PageUp) => {
                 self.page_up();
             }
             key!(Home) => {
@@ -1280,6 +1629,16 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             ctrl!('t') => {
                 self.toggle_preview();
             }
+            // Preview line scrolling. Alt-d/f/b are intentionally avoided here:
+            // the prompt keybinds (which also apply in pickers) use them for
+            // word editing in the query, and full-page preview scrolling is
+            // already on PageUp/PageDown.
+            alt!('k') | shift!(Up) if self.preview_shown() => {
+                self.scroll_preview_line_up(ctx.editor);
+            }
+            alt!('j') | shift!(Down) if self.preview_shown() => {
+                self.scroll_preview_line_down(ctx.editor);
+            }
             _ => {
                 self.prompt_handle_event(event, ctx);
             }
@@ -1309,6 +1668,8 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
 
     fn required_size(&mut self, (width, height): (u16, u16)) -> Option<(u16, u16)> {
         self.completion_height = height.saturating_sub(4 + self.header_height());
+        // The preview pane's inner height: the box borders take two rows.
+        self.preview_height = height.saturating_sub(2);
         Some((width, height))
     }
 
