@@ -55,6 +55,9 @@ type OpResult = Option<Result<String, String>>;
 pub(super) struct FileOperation<'a> {
     /// The entry the operation acts on, i.e. the explorer's selected row.
     pub path: &'a Path,
+    /// Whether that entry is a directory, as the explorer already knows it —
+    /// cheaper and more consistent than asking the filesystem again.
+    pub is_dir: bool,
     /// The directory the explorer is showing.
     pub root: PathBuf,
     /// Where the picker's cursor sits, so it can be restored once the explorer
@@ -268,6 +271,29 @@ pub(super) fn yank_selected_path(cx: &mut Context, op: FileOperation<'_>) {
     }
 }
 
+/// Moves the explorer into the selected directory: the `l` of yazi's `h`/`l`
+/// tree navigation.
+///
+/// Unlike `Enter`, this only ever walks the tree. On a file it does nothing at
+/// all rather than opening it, so that `l` is a movement key and nothing else.
+pub(super) fn enter_directory(cx: &mut Context, op: FileOperation<'_>) {
+    let FileOperation {
+        path,
+        is_dir,
+        picker_mode,
+        ..
+    } = op;
+
+    if !is_dir {
+        return;
+    }
+
+    // Normalized the way the picker's own callback normalizes it, so that
+    // descending through the `..` row lands where `Enter` would.
+    let root = helix_stdx::path::normalize(path);
+    open_file_explorer(ExplorerCursor::Row(0), picker_mode, cx, root);
+}
+
 /// Moves the explorer to the parent of the directory it is showing: the `h` of
 /// yazi's `h`/`l` tree navigation, and the same move as pressing `Enter` on the
 /// `..` row.
@@ -304,6 +330,7 @@ pub(super) fn create_file_or_directory(cx: &mut Context, op: FileOperation<'_>) 
         root,
         cursor,
         picker_mode,
+        ..
     } = op;
 
     create_file_operation_prompt(
@@ -385,6 +412,7 @@ fn move_selected_with(
         root,
         cursor,
         picker_mode,
+        ..
     } = op;
 
     if let Err(err) = check_within_root(&root, path) {
@@ -477,6 +505,7 @@ pub(super) fn delete_selected(cx: &mut Context, op: FileOperation<'_>) {
         root,
         cursor,
         picker_mode,
+        ..
     } = op;
 
     if let Err(err) = check_within_root(&root, path) {
@@ -559,6 +588,7 @@ pub(super) fn copy_selected(cx: &mut Context, op: FileOperation<'_>) {
         root,
         cursor,
         picker_mode,
+        ..
     } = op;
 
     create_file_operation_prompt(
@@ -833,11 +863,12 @@ pub(super) fn paste_clipboard(cx: &mut Context, op: FileOperation<'_>) {
 fn file_operation_key(operation: fn(&mut Context, FileOperation<'_>)) -> KeyHandler {
     Box::new(
         move |cx, args: PickerAction<'_, ExplorerItem, ExplorerData>| {
-            let (path, _is_dir) = args.selection;
+            let (path, is_dir) = args.selection;
             operation(
                 cx,
                 FileOperation {
                     path,
+                    is_dir: *is_dir,
                     root: args.data.0.clone(),
                     cursor: args.cursor,
                     picker_mode: args.mode,
@@ -979,6 +1010,7 @@ fn file_explorer_with_mode(
     // still get to the query.
     .with_modal_key_handlers(hashmap! {
         key!('h') => file_operation_key(parent_directory),
+        key!('l') => file_operation_key(enter_directory),
         key!('a') => file_operation_key(create_file_or_directory),
         key!('r') => file_operation_key(rename_selected),
         key!('m') => file_operation_key(move_selected),
