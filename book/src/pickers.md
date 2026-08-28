@@ -13,3 +13,5 @@ You can insert the contents of a [register](./registers.md) using `Ctrl-r` follo
 ### File explorer
 
 `Space-e` opens an interactive file explorer for browsing and opening files, rooted at the workspace; `Space-.` opens one rooted at the current buffer's directory. Unlike the file picker, the explorer does not ignore most files by default; its ignore behaviour is configured separately in the [`[editor.file-explorer]`](./editor.md#editorfile-explorer-section) section.
+
+The explorer can also act on the entry under the cursor: `Alt-n` creates a file or directory, `Alt-m` moves one, `Alt-r` renames one, `Alt-x` deletes one, `Alt-c` copies a file and `Alt-y` yanks a path to a register. Deleting, and overwriting an existing path with a move, rename or copy, always ask for confirmation first. See the [file explorer keys](./keymap.md#file-explorer) for the details.
