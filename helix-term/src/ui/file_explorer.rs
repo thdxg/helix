@@ -1,7 +1,7 @@
 use std::error::Error as _;
 use std::{
     fs,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 
 use helix_core::hashmap;
@@ -69,18 +69,35 @@ pub(super) struct FileOperation<'a> {
     pub picker_mode: PickerMode,
 }
 
+/// Everything an operation on the directory the explorer is showing needs from
+/// it.
+///
+/// The counterpart to [`FileOperation`], for the operations that act on the
+/// directory rather than on the entry under the cursor. They keep working when
+/// the explorer has no selection — an empty directory, or a query that matches
+/// nothing — which is exactly when leaving for the parent or creating the first
+/// entry matters most.
+pub(super) struct DirectoryOperation<'a> {
+    /// The entry under the cursor, when there is one. Used only as an anchor by
+    /// operations that resolve a path next to it; never acted on.
+    pub selected: Option<&'a Path>,
+    /// The directory the explorer is showing.
+    pub root: PathBuf,
+    /// Where the picker's cursor sits, so it can be restored once the explorer
+    /// is reread.
+    pub cursor: u32,
+    /// Which mode the picker is in, so that a user who is driving the explorer
+    /// from normal mode stays in normal mode once it is reread.
+    pub picker_mode: PickerMode,
+}
+
 /// Checks that `path` is an entry inside `root` that destructive operations may
 /// act on.
 ///
-/// The explorer inserts a `..` row at the top of the list for navigating
-/// upwards. Destructive operations must refuse it: it resolves to the parent of
-/// the explorer root, so deleting or moving it would act well outside anything
-/// the user can see.
+/// Both paths are normalized first, so a `..` component cannot smuggle a
+/// destination out of the root: it is resolved away before the comparison
+/// rather than being compared as a component of its own.
 fn check_within_root(root: &Path, path: &Path) -> Result<(), String> {
-    if path.components().next_back() == Some(Component::ParentDir) {
-        return Err("Cannot operate on the parent directory entry".to_string());
-    }
-
     let root = helix_stdx::path::normalize(root);
     let normalized = helix_stdx::path::normalize(path);
 
@@ -102,16 +119,19 @@ fn check_within_root(root: &Path, path: &Path) -> Result<(), String> {
 /// a bare name next to the entry the prompt names does what it looks like it
 /// does.
 fn resolve_destination(anchor: &Path, input: &str) -> PathBuf {
+    resolve_in_directory(anchor.parent().unwrap_or(Path::new("")), input)
+}
+
+/// As [`resolve_destination`], but resolving a relative path inside `directory`
+/// itself rather than next to an entry of it.
+fn resolve_in_directory(directory: &Path, input: &str) -> PathBuf {
     let expanded = helix_stdx::path::expand_tilde(PathBuf::from(input));
 
     if expanded.is_absolute() {
         return expanded.into_owned();
     }
 
-    match anchor.parent() {
-        Some(parent) => parent.join(expanded),
-        None => expanded.into_owned(),
-    }
+    directory.join(expanded)
 }
 
 /// Runs `overwrite`, asking the user to confirm first if `overwriting` already
@@ -289,24 +309,22 @@ pub(super) fn enter_directory(cx: &mut Context, op: FileOperation<'_>) {
         return;
     }
 
-    // Normalized the way the picker's own callback normalizes it, so that
-    // descending through the `..` row lands where `Enter` would.
+    // Normalized the way the picker's own callback normalizes it, so that `l`
+    // lands where `Enter` would.
     let root = helix_stdx::path::normalize(path);
     open_file_explorer(ExplorerCursor::Row(0), picker_mode, cx, root);
 }
 
 /// Moves the explorer to the parent of the directory it is showing: the `h` of
-/// yazi's `h`/`l` tree navigation, and the same move as pressing `Enter` on the
-/// `..` row.
+/// yazi's `h`/`l` tree navigation.
 ///
 /// The cursor lands on the directory just left, so that `h` and `l` retrace each
 /// other's steps.
-pub(super) fn parent_directory(cx: &mut Context, op: FileOperation<'_>) {
-    let FileOperation {
+pub(super) fn parent_directory(cx: &mut Context, op: DirectoryOperation<'_>) {
+    let DirectoryOperation {
         root, picker_mode, ..
     } = op;
 
-    // Spelled the way the `..` row is, so that the two agree about where up is.
     let parent = helix_stdx::path::normalize(root.join(".."));
     if parent == root {
         cx.editor
@@ -325,28 +343,32 @@ pub(super) fn parent_directory(cx: &mut Context, op: FileOperation<'_>) {
 /// separator. Missing intermediate directories are created too.
 ///
 /// Asks for confirmation before overwriting an existing path.
-pub(super) fn create_file_or_directory(cx: &mut Context, op: FileOperation<'_>) {
-    let FileOperation {
-        path,
+pub(super) fn create_file_or_directory(cx: &mut Context, op: DirectoryOperation<'_>) {
+    let DirectoryOperation {
+        selected,
         root,
         cursor,
         picker_mode,
-        ..
     } = op;
+
+    // The directory the new entry lands in, both as the prefill and as what a
+    // relative name is resolved against: the one holding the entry under the
+    // cursor — which `flatten_dirs` can put below the root — and the root itself
+    // when there is no entry to sit next to.
+    let directory = selected
+        .and_then(Path::parent)
+        .unwrap_or(&root)
+        .to_path_buf();
 
     create_file_operation_prompt(
         cx,
-        path,
+        &directory,
         |_| "Create: ".into(),
         None,
-        |path| {
-            path.parent()
-                .map(|p| format!("{}{}", p.display(), std::path::MAIN_SEPARATOR))
-                .unwrap_or_default()
-        },
-        move |cx, selected, to_create_string| {
+        |directory| format!("{}{}", directory.display(), std::path::MAIN_SEPARATOR),
+        move |cx, directory, to_create_string| {
             let root = root.clone();
-            let to_create = resolve_destination(selected, &to_create_string);
+            let to_create = resolve_in_directory(directory, &to_create_string);
 
             confirm_before_overwriting(
                 to_create.clone(),
@@ -663,8 +685,8 @@ fn staged_description(paths: &[PathBuf]) -> String {
 fn stage_on_clipboard(cx: &mut Context, op: FileOperation<'_>, mode: ClipboardMode) {
     let FileOperation { path, root, .. } = op;
 
-    // Staging the `..` row, the root, or anything outside it is refused here so
-    // that a later paste can never be handed a path the explorer does not own.
+    // Staging the root, or anything outside it, is refused here so that a later
+    // paste can never be handed a path the explorer does not own.
     if let Err(err) = check_within_root(&root, path) {
         cx.editor.set_error(err);
         return;
@@ -805,8 +827,8 @@ fn paste_entry(
 /// The destination is the explorer's root rather than the entry under the
 /// cursor, matching how yazi's paste behaves. Overwriting an existing entry is
 /// confirmed first, and the confirmation defaults to "no".
-pub(super) fn paste_clipboard(cx: &mut Context, op: FileOperation<'_>) {
-    let FileOperation {
+pub(super) fn paste_clipboard(cx: &mut Context, op: DirectoryOperation<'_>) {
+    let DirectoryOperation {
         root,
         cursor,
         picker_mode,
@@ -860,16 +882,41 @@ pub(super) fn paste_clipboard(cx: &mut Context, op: FileOperation<'_>) {
     }
 }
 
-/// Wraps one of the file operations above into a picker key handler.
+/// Wraps one of the entry operations above into a picker key handler.
+///
+/// The operation does not run at all when the explorer has no selection: there
+/// is no entry for it to act on.
 fn file_operation_key(operation: fn(&mut Context, FileOperation<'_>)) -> KeyHandler {
     Box::new(
         move |cx, args: PickerAction<'_, ExplorerItem, ExplorerData>| {
-            let (path, is_dir) = args.selection;
+            let Some((path, is_dir)) = args.selection else {
+                return;
+            };
             operation(
                 cx,
                 FileOperation {
                     path,
                     is_dir: *is_dir,
+                    root: args.data.0.clone(),
+                    cursor: args.cursor,
+                    picker_mode: args.mode,
+                },
+            )
+        },
+    )
+}
+
+/// Wraps one of the directory operations above into a picker key handler.
+///
+/// Unlike [`file_operation_key`], the operation runs whether or not the explorer
+/// has a selection.
+fn directory_operation_key(operation: fn(&mut Context, DirectoryOperation<'_>)) -> KeyHandler {
+    Box::new(
+        move |cx, args: PickerAction<'_, ExplorerItem, ExplorerData>| {
+            operation(
+                cx,
+                DirectoryOperation {
+                    selected: args.selection.map(|(path, _is_dir)| path.as_path()),
                     root: args.data.0.clone(),
                     cursor: args.cursor,
                     picker_mode: args.mode,
@@ -897,9 +944,6 @@ fn cursor_row(cursor: ExplorerCursor, directory_content: &[ExplorerItem]) -> u32
         // for the directory being left may name a path below it rather than
         // exactly it. `Path::starts_with` works a component at a time, so
         // neither test can confuse `foo` with a sibling `foobar`.
-        //
-        // The first row, `..`, never matches: no path under the root starts with
-        // it, and it starts with nothing but itself.
         ExplorerCursor::Entry(entry) => directory_content
             .iter()
             .position(|(path, is_dir)| {
@@ -1006,7 +1050,13 @@ fn file_explorer_with_mode(
     .with_mode_handle(mode)
     .with_preview(|_editor, (path, _is_dir)| Some((path.as_path().into(), None)))
     .with_key_handlers(hashmap! {
-        alt!('n') => file_operation_key(create_file_or_directory),
+        // Tree navigation, spelled after the `h`/`l` of the modal layout below
+        // so that the two agree about which way is up. A non-modal picker has no
+        // normal mode to take the unmodified keys in, and these are the only way
+        // out of the directory the explorer opened on there.
+        alt!('h') => directory_operation_key(parent_directory),
+        alt!('l') => file_operation_key(enter_directory),
+        alt!('n') => directory_operation_key(create_file_or_directory),
         alt!('m') => file_operation_key(move_selected),
         alt!('r') => file_operation_key(rename_selected),
         alt!('x') => file_operation_key(delete_selected),
@@ -1018,7 +1068,7 @@ fn file_explorer_with_mode(
         // `Alt-t` (take) and `Alt-w`, the latter after Emacs' `M-w` for copy.
         alt!('t') => file_operation_key(cut_selected),
         alt!('w') => file_operation_key(copy_selected_to_clipboard),
-        alt!('p') => file_operation_key(paste_clipboard),
+        alt!('p') => directory_operation_key(paste_clipboard),
     })
     // A yazi-like layout on unmodified keys, live only in the normal mode of a
     // modal picker (`editor.picker.modal`). Normal mode never types into the
@@ -1031,14 +1081,14 @@ fn file_explorer_with_mode(
     // `a` shadows one of the picker's three ways into insert mode; `i` and `/`
     // still get to the query.
     .with_modal_key_handlers(hashmap! {
-        key!('h') => file_operation_key(parent_directory),
+        key!('h') => directory_operation_key(parent_directory),
         key!('l') => file_operation_key(enter_directory),
-        key!('a') => file_operation_key(create_file_or_directory),
+        key!('a') => directory_operation_key(create_file_or_directory),
         key!('r') => file_operation_key(rename_selected),
         key!('m') => file_operation_key(move_selected),
         key!('d') => file_operation_key(cut_selected),
         key!('y') => file_operation_key(copy_selected_to_clipboard),
-        key!('p') => file_operation_key(paste_clipboard),
+        key!('p') => directory_operation_key(paste_clipboard),
         key!('D') => file_operation_key(delete_selected),
         key!('Y') => file_operation_key(yank_selected_path),
     });
@@ -1060,10 +1110,11 @@ mod test {
         // `flatten_dirs` can produce entries nested deeper than one level.
         assert!(check_within_root(root, Path::new("/home/user/project/a/b/c")).is_ok());
 
-        // The `..` row the explorer inserts must never be operated on.
-        assert!(check_within_root(root, Path::new("/home/user/project/..")).is_err());
-        // Neither may the root itself, nor anything outside it.
+        // The root itself may not be operated on, nor anything outside it.
         assert!(check_within_root(root, root).is_err());
+        // A `..` is resolved away before the comparison, so it cannot be used to
+        // name something outside the root.
+        assert!(check_within_root(root, Path::new("/home/user/project/..")).is_err());
         assert!(check_within_root(root, Path::new("/home/user/other")).is_err());
         assert!(check_within_root(root, Path::new("/home/user/project/../other")).is_err());
         // A sibling whose name merely starts with the root's name is outside it.
@@ -1071,12 +1122,10 @@ mod test {
     }
 
     /// The rows of an explorer showing `/home/user/project`, in the order
-    /// `directory_content` builds them: `..` first, then directories, then
-    /// files. `src/main.rs` stands for a directory flattened past its single
-    /// child.
+    /// `directory_content` builds them: directories first, then files.
+    /// `target/debug` stands for a directory flattened past its single child.
     fn test_rows() -> Vec<ExplorerItem> {
         [
-            ("/home/user/project/..", true),
             ("/home/user/project/src", true),
             ("/home/user/project/target/debug", true),
             ("/home/user/project/Cargo.toml", false),
@@ -1094,23 +1143,24 @@ mod test {
 
         // A row is kept as it is, but never past the last one: entries may have
         // been deleted since the row was captured.
-        assert_eq!(cursor_row(ExplorerCursor::Row(3), &rows), 3);
-        assert_eq!(cursor_row(ExplorerCursor::Row(99), &rows), 4);
+        assert_eq!(cursor_row(ExplorerCursor::Row(2), &rows), 2);
+        assert_eq!(cursor_row(ExplorerCursor::Row(99), &rows), 3);
         assert_eq!(cursor_row(ExplorerCursor::Row(0), &[]), 0);
 
         // A file the explorer lists is found on its own row.
-        assert_eq!(row_for("/home/user/project/README.md"), 4);
+        assert_eq!(row_for("/home/user/project/README.md"), 3);
         // One nested deeper is found on the directory holding it, whether the
         // row names that directory exactly or a flattened path below it.
-        assert_eq!(row_for("/home/user/project/src/ui/picker.rs"), 1);
-        assert_eq!(row_for("/home/user/project/target/debug/hx"), 2);
+        assert_eq!(row_for("/home/user/project/src/ui/picker.rs"), 0);
+        assert_eq!(row_for("/home/user/project/target/debug/hx"), 1);
         // A directory being left is found even when the row for it was
         // flattened past it.
-        assert_eq!(row_for("/home/user/project/target"), 2);
+        assert_eq!(row_for("/home/user/project/target"), 1);
 
         // Anything the explorer is not showing leaves the cursor at the top,
-        // including the parent of the root: the `..` row is never landed on by
-        // name.
+        // the parent of the root included. That is the same row a match on the
+        // first entry gives, so these only pin the fallback down, not the
+        // absence of a match.
         assert_eq!(row_for("/home/user/other/main.rs"), 0);
         assert_eq!(row_for("/home/user"), 0);
         // Nor is a sibling whose name merely starts with a listed one.
@@ -1130,6 +1180,24 @@ mod test {
         // An absolute destination is taken as given.
         assert_eq!(
             resolve_destination(anchor, "/tmp/lib.rs"),
+            PathBuf::from("/tmp/lib.rs")
+        );
+    }
+
+    #[test]
+    fn test_resolve_in_directory() {
+        let directory = Path::new("/home/user/project/src");
+
+        // A bare name lands inside the directory itself, not next to it — this
+        // is what `Alt-n` resolves against, including in a directory with no
+        // entry to anchor on.
+        assert_eq!(
+            resolve_in_directory(directory, "lib.rs"),
+            PathBuf::from("/home/user/project/src/lib.rs")
+        );
+        // An absolute destination is taken as given.
+        assert_eq!(
+            resolve_in_directory(directory, "/tmp/lib.rs"),
             PathBuf::from("/tmp/lib.rs")
         );
     }

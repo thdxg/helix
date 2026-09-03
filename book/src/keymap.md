@@ -534,10 +534,13 @@ picker and every key types into the query, exactly as before.
 ### File explorer
 
 These extra keys are available in the file explorer (`Space-e` and `Space-.`).
-They act on the entry under the cursor.
+Most act on the entry under the cursor; the tree navigation, create and paste
+keys act on the directory being shown.
 
 | Key                          | Description                                                |
 | -----                        | -------------                                              |
+| `Alt-h`                      | Go to the parent of the directory being shown              |
+| `Alt-l`                      | Enter the selected directory                               |
 | `Alt-n`                      | Create a new file, or a directory if the name ends with `/`|
 | `Alt-m`                      | Move the selected file or directory                        |
 | `Alt-r`                      | Rename the selected file or directory                      |
@@ -557,9 +560,16 @@ just its name; both put the cursor before the file extension, since a rename
 usually keeps it. A relative destination is resolved next to the entry the prompt
 names, not against the working directory.
 
+`Alt-h` and `Alt-l` walk the directory tree; `Alt-l` descends into the selected
+directory and does nothing on a file, leaving `Enter` as the way to open
+something.
+
+`Alt-h`, `Alt-n` and `Alt-p` act on the directory being shown rather than on the
+entry under the cursor, so they keep working when there is no entry under it — an
+empty directory, or a query that matches nothing. The rest do nothing there.
+
 `Alt-n` creates any missing intermediate directories. `Alt-c` does not support
-directories — use `Alt-w` and `Alt-p`, which copy recursively. `Alt-m`, `Alt-r`,
-`Alt-x`, `Alt-t` and `Alt-w` refuse to act on the `..` entry, and neither `Alt-x`
+directories — use `Alt-w` and `Alt-p`, which copy recursively. Neither `Alt-x`
 nor `Alt-p` will touch anything outside the directory the explorer is showing.
 
 ### File explorer clipboard
@@ -595,10 +605,10 @@ both modes.
 | `Y`                          | Yank the path of the selected file or directory            |
 | `m`                          | Move the selected file or directory to a typed destination |
 
-`h` and `l` walk the tree as they do in yazi. `l` descends into the selected
-directory and does nothing on a file — it is a movement key, and `Enter` remains
-the way to open something. `h` moves to the parent of the directory being shown,
-the same move as `Enter` on the `..` row, and leaves the cursor on the directory
+`h` and `l` walk the tree as they do in yazi, doing the same as `Alt-h` and
+`Alt-l`. `l` descends into the selected directory and does nothing on a file — it
+is a movement key, and `Enter` remains the way to open something. `h` moves to
+the parent of the directory being shown, and leaves the cursor on the directory
 just left so that `h` and `l` retrace each other's steps.
 
 Unlike yazi, `d` cuts and `D` deletes rather than `x` cutting and `d` trashing:

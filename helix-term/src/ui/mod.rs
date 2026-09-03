@@ -361,10 +361,6 @@ fn directory_content(root: &Path, editor: &Editor) -> Result<Vec<(PathBuf, bool)
 
     content.sort_by(|(path1, is_dir1), (path2, is_dir2)| (!is_dir1, path1).cmp(&(!is_dir2, path2)));
 
-    if root.parent().is_some() {
-        content.insert(0, (root.join(".."), true));
-    }
-
     Ok(content)
 }
 

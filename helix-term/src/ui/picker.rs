@@ -643,8 +643,10 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     ///
     /// The handlers are consulted before the picker's own key handling and before
     /// the embedded prompt sees the key, so a handler may shadow a built-in
-    /// binding. A handler only runs when the picker has a selection; otherwise the
-    /// key falls through to the normal handling.
+    /// binding. A handler runs whether or not the picker has a selection, so
+    /// that a picker with nothing under the cursor — no options at all, or a
+    /// query that matches none of them — is not a dead end; see
+    /// [`PickerAction::selection`].
     ///
     /// Prefer keys that the picker and its prompt do not already use. Notably
     /// taken are `Alt-Enter`, `Alt-b`, `Alt-d`, `Alt-f`, `Alt-Backspace`,
@@ -654,7 +656,8 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     /// let picker = Picker::new(columns, 0, options, data, callback)
     ///     .with_key_handlers(hashmap! {
     ///         alt!('y') => Box::new(|cx, args: PickerAction<'_, MyItem, MyData>| {
-    ///             cx.editor.set_status(args.selection.to_string());
+    ///             let Some(selection) = args.selection else { return };
+    ///             cx.editor.set_status(selection.to_string());
     ///         }) as PickerKeyHandler<MyItem, MyData>,
     ///     });
     /// ```
@@ -709,14 +712,11 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         let Some(handler) = handlers.get(event) else {
             return false;
         };
-        let Some(selection) = self.selection() else {
-            return false;
-        };
 
         handler(
             cx,
             PickerAction {
-                selection,
+                selection: self.selection(),
                 data: Arc::clone(&self.editor_data),
                 cursor: self.cursor,
                 mode: self.mode(cx.editor),
@@ -2063,8 +2063,11 @@ type PickerCallback<T> = Box<dyn Fn(&mut Context, &T, Action)>;
 
 /// The picker state handed to a [`PickerKeyHandler`] when its key is pressed.
 pub struct PickerAction<'a, T, D> {
-    /// The item currently under the picker's cursor.
-    pub selection: &'a T,
+    /// The item currently under the picker's cursor, or `None` when there is
+    /// nothing under it: a picker with no options, or a query that matches none
+    /// of them. A handler that acts on an item returns early; one that acts on
+    /// the picker as a whole carries on regardless.
+    pub selection: Option<&'a T>,
     /// The data shared by every item of the picker, as passed to
     /// [`Picker::new`].
     pub data: Arc<D>,
