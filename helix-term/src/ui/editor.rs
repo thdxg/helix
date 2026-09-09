@@ -375,6 +375,7 @@ impl EditorView {
             let placement = draw_raster(
                 surface,
                 &mut editor.graphics,
+                media::PlacementSite::View(view_id),
                 inner,
                 &raster,
                 kind == media::MediaKind::Pdf,

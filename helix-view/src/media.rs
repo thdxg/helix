@@ -118,6 +118,45 @@ pub fn detect_graphics_mode(config: ImageRenderingConfig) -> GraphicsMode {
 /// have paged away from and let them be retransmitted from the PNG cache.
 const MAX_LOADED_IMAGES: usize = 4;
 
+/// The largest placement id a placeholder cell can name. Kitty carries the id
+/// in the cell's underline colour, so it is 24-bit, and zero means
+/// "unspecified" -- ids run from 1.
+const MAX_PLACEMENT_ID: u32 = 0xFF_FFFF;
+
+/// The site drawing a placement: an editor view, or the picker's preview pane.
+///
+/// Two sites can show one page at the same time -- a media view with the file
+/// explorer's preview of the same file over it, or the same document in two
+/// splits -- and they size it differently. The protocol addresses that with
+/// placement ids: one transmitted image, a placement per site, each with its
+/// own cell geometry.
+///
+/// Without them the terminal has no way to tell the sites apart. Every
+/// transmission without a placement id makes *another* anonymous placement of
+/// the image, and a placeholder cell that names no placement is drawn from
+/// whichever of them the terminal happens to find first -- so a page would
+/// come out sized for the other site: half-drawn, or blank where the cells
+/// address rows the placement does not have.
+///
+/// A cell names its placement in its underline colour, so this rests on the
+/// terminal accepting one (`SGR 58`). Every terminal we place images on does;
+/// one that did not would be back to choosing among an image's placements for
+/// itself, which is where we started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PlacementSite {
+    /// A media document rendered in an editor view.
+    View(crate::ViewId),
+    /// The picker's preview pane, of which there is one at a time.
+    Preview,
+}
+
+/// What a [`Placement`] is for: one image as shown by one site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PlacementKey {
+    image: u32,
+    placement: u32,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Placement {
     /// (cols, rows) the virtual placement was transmitted with.
@@ -137,17 +176,33 @@ pub struct GraphicsState {
     pub window_px: Option<(u16, u16)>,
     /// Escape sequences to write to the terminal before the next draw.
     pending: Vec<String>,
-    /// image id -> the virtual placement already transmitted for it.
-    placements: HashMap<u32, Placement>,
+    /// The virtual placements already transmitted, one per image per site.
+    placements: HashMap<PlacementKey, Placement>,
+    /// The placement id handed to each site, allocated on first use. Ids are
+    /// carried in a cell's underline colour, so they are 24-bit, and nonzero:
+    /// zero is the protocol's "unspecified", which is what we are getting away
+    /// from. They stay put for the life of the editor -- a placement is only
+    /// ever the same site's if the id it was transmitted with is still that
+    /// site's.
+    sites: HashMap<PlacementSite, u32>,
     /// Incremented per rendered frame, to tell images drawn in this frame from
     /// ones left over from earlier pages.
     frame: u64,
 }
 
 impl GraphicsState {
-    /// Queue a (re)transmission unless this raster is already placed at this
-    /// size and has been on screen continuously. Returns false when graphics
-    /// are unavailable.
+    /// The placement id `site` draws with, allocated on first use.
+    fn placement_id(&mut self, site: PlacementSite) -> u32 {
+        // Sites are never removed, so the count is a fresh id. The modulo is
+        // for form's sake -- it would take 16 million drawing sites to reach.
+        let next = self.sites.len() as u32 % MAX_PLACEMENT_ID + 1;
+        *self.sites.entry(site).or_insert(next)
+    }
+
+    /// Queue a (re)transmission of `raster` as `site`'s placement unless that
+    /// placement is already this size and has been on screen continuously.
+    /// Returns the placement id to name in the placeholder cells, or `None`
+    /// when graphics are unavailable.
     ///
     /// An image that went a frame without being drawn is retransmitted rather
     /// than reused, because by then the terminal may no longer have it: it
@@ -163,28 +218,37 @@ impl GraphicsState {
     /// Retransmitting is a path, not pixels -- see [`transmit_escape`] -- so
     /// this costs a short escape on the frame a page comes back, and nothing
     /// at all while it stays on screen.
-    pub fn ensure_placement(&mut self, raster: &Raster, cols: u16, rows: u16) -> bool {
+    pub fn ensure_placement(
+        &mut self,
+        raster: &Raster,
+        site: PlacementSite,
+        cols: u16,
+        rows: u16,
+    ) -> Option<u32> {
         match self.mode {
-            GraphicsMode::None => false,
+            GraphicsMode::None => None,
             GraphicsMode::Kitty => {
+                let placement = self.placement_id(site);
+                let key = PlacementKey {
+                    image: raster.id,
+                    placement,
+                };
                 let frame = self.frame;
-                match self.placements.get_mut(&raster.id) {
+                match self.placements.get_mut(&key) {
                     // `used + 1 >= frame` is "drawn in the frame before this
                     // one, or already in this one": placements are recorded
                     // with the frame counter as it stands during the render,
                     // which `take_pending` moves on at the end of each one.
-                    Some(placement)
-                        if placement.size == (cols, rows) && placement.used + 1 >= frame =>
+                    Some(existing)
+                        if existing.size == (cols, rows) && existing.used + 1 >= frame =>
                     {
-                        placement.used = frame
+                        existing.used = frame
                     }
-                    slot => {
-                        if slot.is_some() {
-                            self.placements.remove(&raster.id);
-                        }
-                        self.pending.push(transmit_escape(raster, cols, rows));
+                    _ => {
+                        self.pending
+                            .push(transmit_escape(raster, placement, cols, rows));
                         self.placements.insert(
-                            raster.id,
+                            key,
                             Placement {
                                 size: (cols, rows),
                                 used: frame,
@@ -193,7 +257,7 @@ impl GraphicsState {
                         self.evict_unused();
                     }
                 }
-                true
+                Some(placement)
             }
         }
     }
@@ -201,22 +265,31 @@ impl GraphicsState {
     /// Release images that were not drawn in the current frame, oldest first,
     /// until at most [`MAX_LOADED_IMAGES`] remain. Images drawn this frame are
     /// never evicted, so several media splits can stay on screen at once.
+    ///
+    /// Freeing an image takes every site's placement of it, so what is counted
+    /// is images rather than placements: one page shown in two sites is one
+    /// image for the terminal to hold.
     fn evict_unused(&mut self) {
-        if self.placements.len() <= MAX_LOADED_IMAGES {
+        // The newest use of each image, across the sites showing it.
+        let mut images: HashMap<u32, u64> = HashMap::new();
+        for (key, placement) in &self.placements {
+            let used = images.entry(key.image).or_insert(placement.used);
+            *used = (*used).max(placement.used);
+        }
+        if images.len() <= MAX_LOADED_IMAGES {
             return;
         }
         let frame = self.frame;
-        let mut stale: Vec<(u64, u32)> = self
-            .placements
+        let mut stale: Vec<(u64, u32)> = images
             .iter()
-            .filter(|(_, placement)| placement.used < frame)
-            .map(|(id, placement)| (placement.used, *id))
+            .filter(|(_, used)| **used < frame)
+            .map(|(image, used)| (*used, *image))
             .collect();
         stale.sort_unstable();
-        let excess = self.placements.len() - MAX_LOADED_IMAGES;
-        for (_, id) in stale.into_iter().take(excess) {
-            self.placements.remove(&id);
-            self.pending.push(delete_escape(id));
+        let excess = images.len() - MAX_LOADED_IMAGES;
+        for (_, image) in stale.into_iter().take(excess) {
+            self.placements.retain(|key, _| key.image != image);
+            self.pending.push(delete_escape(image));
         }
     }
 
@@ -227,6 +300,10 @@ impl GraphicsState {
 
     /// Forget everything transmitted (e.g. after the terminal was released and
     /// reclaimed on suspend/resume); placements will be retransmitted lazily.
+    ///
+    /// The sites keep their placement ids: nothing is wrong with them, and a
+    /// site that keeps the id it had also keeps its placement across the
+    /// retransmission rather than piling up a second one.
     pub fn reset(&mut self) {
         self.placements.clear();
         self.pending.clear();
@@ -276,13 +353,17 @@ pub fn placeholder_symbol(row: u16, col: u16) -> Option<[char; 3]> {
     Some([PLACEHOLDER, r, c])
 }
 
-fn transmit_escape(raster: &Raster, cols: u16, rows: u16) -> String {
+fn transmit_escape(raster: &Raster, placement: u32, cols: u16, rows: u16) -> String {
     // t=f: payload is a path to a PNG the terminal reads itself, so the
     // escape stays tiny. U=1: virtual placement (unicode placeholders).
-    // q=2: never send responses (we do not parse APC replies).
+    // q=2: never send responses (we do not parse APC replies). p=: the
+    // placement belongs to one drawing site, and replaces only that site's
+    // (see `PlacementSite`); without it every transmission would leave the
+    // terminal another anonymous placement to choose between.
     format!(
-        "\x1b_Ga=T,U=1,q=2,f=100,t=f,i={},c={},r={};{}\x1b\\",
+        "\x1b_Ga=T,U=1,q=2,f=100,t=f,i={},p={},c={},r={};{}\x1b\\",
         raster.id,
+        placement,
         cols,
         rows,
         base64(raster.png.to_string_lossy().as_bytes()),
@@ -726,6 +807,23 @@ mod tests {
         }
     }
 
+    /// The site the tests below draw as. Which one it is does not matter --
+    /// what matters is that `other_site` is a different one.
+    const TEST_SITE: PlacementSite = PlacementSite::Preview;
+
+    /// A second site, standing in for the media view under a preview of the
+    /// same file.
+    fn other_site() -> PlacementSite {
+        PlacementSite::View(crate::ViewId::default())
+    }
+
+    impl GraphicsState {
+        /// Whether any site holds a placement of this image.
+        fn holds(&self, image: u32) -> bool {
+            self.placements.keys().any(|key| key.image == image)
+        }
+    }
+
     #[test]
     fn paging_frees_images_it_has_left_behind() {
         let mut state = GraphicsState {
@@ -736,13 +834,15 @@ mod tests {
         let mut escapes = String::new();
         // One new image per frame, as paging through a PDF does.
         for id in 1..=pages {
-            assert!(state.ensure_placement(&test_raster(id), 10, 10));
+            assert!(state
+                .ensure_placement(&test_raster(id), TEST_SITE, 10, 10)
+                .is_some());
             escapes.extend(state.take_pending());
         }
         assert!(state.placements.len() <= MAX_LOADED_IMAGES);
         // The page on screen is still loaded, the first pages were freed.
-        assert!(state.placements.contains_key(&pages));
-        assert!(!state.placements.contains_key(&1));
+        assert!(state.holds(pages));
+        assert!(!state.holds(1));
         assert!(escapes.contains("a=d,d=I,i=1,"), "no delete for image 1");
     }
 
@@ -756,10 +856,52 @@ mod tests {
         // same frame, so none may be evicted even past the limit.
         let ids = 1..=(MAX_LOADED_IMAGES as u32 + 2);
         for id in ids.clone() {
-            state.ensure_placement(&test_raster(id), 10, 10);
+            state.ensure_placement(&test_raster(id), TEST_SITE, 10, 10);
         }
         assert_eq!(state.placements.len(), ids.count());
         assert!(!state.take_pending().iter().any(|e| e.contains("a=d")));
+    }
+
+    #[test]
+    fn two_sites_showing_one_page_keep_their_own_placements() {
+        let mut state = GraphicsState {
+            mode: GraphicsMode::Kitty,
+            ..Default::default()
+        };
+        let page = test_raster(7);
+
+        // A media view with the picker's preview of the same file over it: one
+        // image, drawn at two sizes within the one frame.
+        let doc = state
+            .ensure_placement(&page, TEST_SITE, 40, 20)
+            .expect("placed");
+        let preview = state
+            .ensure_placement(&page, other_site(), 20, 10)
+            .expect("placed");
+        assert_ne!(doc, preview, "the two sites were given one placement id");
+        let escapes = state.take_pending();
+        let placed = |p: u32, cols: u16, rows: u16| {
+            let want = format!("p={p},c={cols},r={rows}");
+            escapes.iter().any(|escape| escape.contains(&want))
+        };
+        assert!(placed(doc, 40, 20), "the view's placement was not sent");
+        assert!(placed(preview, 20, 10), "the preview's was not sent");
+
+        // Both sizes stand: on the next frame neither site has anything to
+        // retransmit, where sharing a placement had them overwriting each
+        // other's geometry frame after frame.
+        assert_eq!(state.ensure_placement(&page, TEST_SITE, 40, 20), Some(doc));
+        assert_eq!(
+            state.ensure_placement(&page, other_site(), 20, 10),
+            Some(preview)
+        );
+        assert!(
+            state.take_pending().is_empty(),
+            "the sites are still retransmitting over each other"
+        );
+
+        // Two placements, but one image for the terminal to hold.
+        assert_eq!(state.placements.len(), 2);
     }
 
     #[test]
@@ -771,12 +913,12 @@ mod tests {
         let page = test_raster(1);
 
         // First frame: transmitted, as nothing is placed yet.
-        assert!(state.ensure_placement(&page, 10, 10));
+        assert!(state.ensure_placement(&page, TEST_SITE, 10, 10).is_some());
         assert_eq!(state.take_pending().len(), 1);
 
         // Held on screen: the placement is reused, frame after frame.
         for _ in 0..3 {
-            assert!(state.ensure_placement(&page, 10, 10));
+            assert!(state.ensure_placement(&page, TEST_SITE, 10, 10).is_some());
             assert!(state.take_pending().is_empty());
         }
 
@@ -784,7 +926,7 @@ mod tests {
         // terminal may have dropped it in the meantime, so coming back to it
         // transmits again rather than trusting cells to be enough.
         state.take_pending();
-        assert!(state.ensure_placement(&page, 10, 10));
+        assert!(state.ensure_placement(&page, TEST_SITE, 10, 10).is_some());
         let escapes = state.take_pending();
         assert_eq!(escapes.len(), 1);
         assert!(escapes[0].contains("i=1,"), "not a transmission of image 1");

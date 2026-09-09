@@ -6,7 +6,7 @@
 
 use helix_view::{
     graphics::{Color, Rect, Style},
-    media::{self, GraphicsState, Raster},
+    media::{self, GraphicsState, PlacementSite, Raster},
 };
 use tui::buffer::Buffer as Surface;
 
@@ -23,16 +23,21 @@ pub struct Placement {
 /// return the cells it covers. Returns `None` — having drawn nothing — when
 /// the terminal has no graphics support, so callers can fall back to text.
 ///
+/// `site` names the view the placement belongs to, so that two sites showing
+/// the same page at different sizes do not fight over one placement of it: see
+/// [`PlacementSite`].
+///
 /// `allow_upscale` is for rasters that can be re-rendered at any size (PDF
 /// pages); images are never blown up past their natural size.
 pub fn draw_raster(
     surface: &mut Surface,
     graphics: &mut GraphicsState,
+    site: PlacementSite,
     area: Rect,
     raster: &Raster,
     allow_upscale: bool,
 ) -> Option<Rect> {
-    draw_raster_panned(surface, graphics, area, raster, allow_upscale, 0)
+    draw_raster_panned(surface, graphics, site, area, raster, allow_upscale, 0)
         .map(|placement| placement.area)
 }
 
@@ -54,6 +59,7 @@ pub fn draw_raster(
 pub fn draw_raster_panned(
     surface: &mut Surface,
     graphics: &mut GraphicsState,
+    site: PlacementSite,
     area: Rect,
     raster: &Raster,
     allow_upscale: bool,
@@ -76,9 +82,7 @@ pub fn draw_raster_panned(
     };
     let (cols, rows) =
         media::fit_placement((raster.width, raster.height), avail, cell_px, allow_upscale);
-    if !graphics.ensure_placement(raster, cols, rows) {
-        return None;
-    }
+    let placement_id = graphics.ensure_placement(raster, site, cols, rows)?;
 
     let max_pan = rows.saturating_sub(area.height);
     let pan = pan.min(max_pan);
@@ -90,12 +94,12 @@ pub fn draw_raster_panned(
         cols,
         visible,
     );
-    // The placeholder's foreground color carries the image id.
-    let id_style = Style::default().fg(Color::Rgb(
-        (raster.id >> 16) as u8,
-        (raster.id >> 8) as u8,
-        raster.id as u8,
-    ));
+    // The placeholder's foreground colour carries the image id and its
+    // underline colour the placement id, which is how a cell says which of an
+    // image's placements it belongs to -- ours, not another site's.
+    let id_style = Style::default()
+        .fg(rgb_id(raster.id))
+        .underline_color(rgb_id(placement_id));
     let mut symbol = String::with_capacity(12);
     for row in 0..visible {
         for col in 0..cols {
@@ -113,6 +117,11 @@ pub fn draw_raster_panned(
         area: placement,
         max_pan,
     })
+}
+
+/// A 24-bit id as the colour a placeholder cell carries it in.
+fn rgb_id(id: u32) -> Color {
+    Color::Rgb((id >> 16) as u8, (id >> 8) as u8, id as u8)
 }
 
 /// Display width of a caption, for centring it under a placement. Captions

@@ -51,7 +51,7 @@ use helix_view::{
     editor::{Action, PickerModeConfig},
     graphics::{CursorKind, Margin, Modifier, Rect},
     input::KeyEvent,
-    media::{GraphicsMode, MediaKind, MediaState},
+    media::{GraphicsMode, MediaKind, MediaState, PlacementSite},
     theme::Style,
     view::ViewPosition,
     Document, DocumentId, Editor,
@@ -1511,6 +1511,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 let placement = ui::media::draw_raster_panned(
                     surface,
                     &mut cx.editor.graphics,
+                    PlacementSite::Preview,
                     image_area,
                     &raster,
                     kind == MediaKind::Pdf,
