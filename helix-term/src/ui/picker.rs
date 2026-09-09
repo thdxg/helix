@@ -244,9 +244,11 @@ impl Preview<'_, '_> {
         }
     }
 
-    /// The rasterized image or PDF page to draw, if this preview is one. Media
-    /// files already open in the editor keep their state on the document, so
-    /// the picker draws whichever page the document is on.
+    /// The rasterized image or PDF page to draw, if this preview is one. A
+    /// media file reached by path has its own state in the preview cache, open
+    /// at the first page, whether or not the editor has the file open too; only
+    /// a preview of a document by id (the buffer picker) draws the page that
+    /// document is on.
     fn media(&self) -> Option<&MediaState> {
         match self {
             Preview::EditorDocument(doc) => doc.media.as_ref(),
@@ -277,9 +279,9 @@ impl Preview<'_, '_> {
 }
 
 /// Where the [`MediaState`] behind a media preview lives, so that the picker
-/// can page it. A media file already open in the editor keeps its state on the
-/// document (and so shares the page with the editor's own view of it);
-/// otherwise the picker owns it in its preview cache.
+/// can page it. The picker owns the state of anything it previewed by path, in
+/// its preview cache. A preview of a document by id -- the buffer picker's --
+/// is the document's own state, and paging it pages the document.
 enum MediaTarget {
     Document(DocumentId),
     Cached(Arc<Path>),
@@ -883,7 +885,15 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
         let id = match path_or_id {
             PathOrId::Id(id) => id,
-            PathOrId::Path(path) => match editor.document_by_path(path) {
+            // As in `get_preview`: a media file reached by path is the
+            // preview's own, so paging it leaves the open document alone. A
+            // text document falls through to the `media` test below and pages
+            // nothing. Only a picker previewing by id -- the buffer picker --
+            // pages a document's own state, which is the state it is showing.
+            PathOrId::Path(path) => match editor
+                .document_by_path(path)
+                .filter(|doc| doc.media.is_none())
+            {
                 Some(doc) => doc.id(),
                 None => {
                     // NOTE: `get_key_value` rather than indexing, to get an
@@ -1095,7 +1105,17 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
         match path_or_id {
             PathOrId::Path(path) => {
-                if let Some(doc) = editor.document_by_path(path) {
+                // A media document is previewed from the file, not from the
+                // open document, even though the document is right there: a
+                // preview is of a file, and the reader's place in a document
+                // is neither the picker's to show nor the picker's to move.
+                // Sharing the document's state opened the preview on whichever
+                // page was being read, and turned the reader's pages under them
+                // when the preview was scrolled.
+                if let Some(doc) = editor
+                    .document_by_path(path)
+                    .filter(|doc| doc.media.is_none())
+                {
                     return Some((Preview::EditorDocument(doc), range));
                 }
 
