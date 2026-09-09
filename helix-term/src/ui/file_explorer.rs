@@ -4,7 +4,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use helix_core::file_watcher::{Event, EventType, FileSystemDidChange};
 use helix_core::hashmap;
+use helix_event::register_hook;
 use helix_view::{
     editor::{ClipboardMode, ExplorerClipboard},
     theme::Style,
@@ -12,11 +14,18 @@ use helix_view::{
 };
 use tui::text::Span;
 
-use crate::{alt, compositor::Context, job::Callback, key};
+use crate::{
+    alt,
+    compositor::Context,
+    job::{self, Callback},
+    key,
+};
 
 use super::prompt::Movement;
 use super::{
-    directory_content, overlay, picker,
+    directory_content,
+    overlay::{self, Overlay},
+    picker,
     picker::{PickerAction, PickerKeyHandler, PickerMode, PickerModeHandle},
     Picker, PickerColumn, Prompt, PromptEvent,
 };
@@ -1096,9 +1105,127 @@ fn file_explorer_with_mode(
     Ok(picker)
 }
 
+/// Whether `event` can have changed what an explorer showing `root` lists.
+///
+/// `root` has to be canonical, since the paths the watcher reports are.
+fn affects_listing(root: &Path, event: &Event) -> bool {
+    // A write leaves the listing alone — it is the same entry with new contents
+    // — and a tempfile came and went inside the watcher's settle period, so it
+    // was never there to list.
+    matches!(event.ty, EventType::Create | EventType::Delete)
+        // Anywhere in the subtree, not just the rows on screen: see the note on
+        // directories in `register_hooks`.
+        && event.path.as_std_path().starts_with(root)
+}
+
+/// Rereads the open explorer when an entry appears in or disappears from the
+/// tree below it, so that a `touch`, a `git checkout` or another editor's save
+/// shows up without the user having to leave the directory and come back.
+///
+/// The watcher reports files and never directories, so a directory that has
+/// appeared or gone is only visible through the files inside it: `mkdir foo` on
+/// its own goes unreported — and stays invisible until something else in the
+/// tree changes — while `rm -r foo` arrives as a deletion of every file under
+/// `foo`. That is why any event in the subtree counts, rather than only ones
+/// naming a row the explorer shows.
+///
+/// Only what the watcher covers can arrive here: the explorer picks up nothing
+/// while `editor.file-watcher.enable` is off, nor in a directory the watcher
+/// skips — outside the workspace, or ignored by the settings under
+/// `editor.file-watcher`, which are not the same as the explorer's own.
+pub(crate) fn register_hooks() {
+    register_hook!(move |event: &mut FileSystemDidChange| {
+        let fs_events = event.fs_events.clone();
+        // Cheap test first, on the watcher's thread: most batches are writes to
+        // files, which no explorer needs to hear about.
+        if !fs_events
+            .iter()
+            .any(|fs_event| matches!(fs_event.ty, EventType::Create | EventType::Delete))
+        {
+            return Ok(());
+        }
+        job::dispatch_blocking(move |editor, compositor| {
+            let Some(Overlay {
+                content: picker, ..
+            }) = compositor.find::<Overlay<FileExplorer>>()
+            else {
+                return;
+            };
+            let root = picker.editor_data().0.clone();
+            // The watcher resolves every symlink in the paths it reports, which
+            // a root the user navigated to need not have resolved.
+            let canonical_root = fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+            if !fs_events
+                .iter()
+                .any(|fs_event| affects_listing(&canonical_root, fs_event))
+            {
+                return;
+            }
+            let Ok(content) = directory_content(&root, editor) else {
+                return;
+            };
+            // Nobody asked for this reread, so it must not move the user: the
+            // cursor stays on the entry it was on, wherever the new listing puts
+            // it, and only follows the rows when that entry is one of the ones
+            // that just went away.
+            let selected = picker.selection().map(|(path, _is_dir)| path.clone());
+            picker.replace_options(content, |(path, _is_dir)| Some(path) == selected.as_ref());
+        });
+        Ok(())
+    });
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+
+    use helix_core::file_watcher::CanonicalPathBuf;
+
+    fn fs_event(path: &str, ty: EventType) -> Event {
+        Event {
+            path: CanonicalPathBuf::assert_canonicalized(Path::new(path)),
+            ty,
+        }
+    }
+
+    #[test]
+    fn test_affects_listing() {
+        let root = Path::new("/home/user/project");
+
+        // A row of the listing appearing or going away.
+        for ty in [EventType::Create, EventType::Delete] {
+            assert!(affects_listing(
+                root,
+                &fs_event("/home/user/project/main.rs", ty)
+            ));
+        }
+
+        // A file deeper in the tree, which is the only sign the watcher gives
+        // that a subdirectory of the root came or went.
+        assert!(affects_listing(
+            root,
+            &fs_event("/home/user/project/src/ui/picker.rs", EventType::Create)
+        ));
+
+        // The same entries, with contents that changed rather than the entry.
+        for ty in [EventType::Modified, EventType::Tempfile] {
+            assert!(!affects_listing(
+                root,
+                &fs_event("/home/user/project/main.rs", ty)
+            ));
+        }
+
+        // Elsewhere in the workspace, including a sibling of the root whose name
+        // starts with the root's own.
+        assert!(!affects_listing(
+            root,
+            &fs_event("/home/user/notes.md", EventType::Create)
+        ));
+        assert!(!affects_listing(
+            root,
+            &fs_event("/home/user/project2/main.rs", EventType::Create)
+        ));
+    }
 
     #[test]
     fn test_check_within_root() {

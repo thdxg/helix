@@ -69,5 +69,7 @@ pub fn setup(config: Arc<ArcSwap<Config>>) -> Handlers {
     prompt::register_hooks(&handlers);
     workspace_trust::register_hooks(&handlers);
     auto_reload::register_hooks(&handlers, &config.load().editor);
+    // The open file explorer rereads itself when the tree below it changes.
+    crate::ui::file_explorer::register_hooks();
     handlers
 }

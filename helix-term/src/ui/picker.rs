@@ -600,6 +600,56 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         }
     }
 
+    /// The data every row of this picker shares, as handed to it at construction.
+    pub(super) fn editor_data(&self) -> &D {
+        &self.editor_data
+    }
+
+    /// Replaces every item in the picker with `options`, for when the source the
+    /// picker was built over has changed underneath it.
+    ///
+    /// Unlike building a new picker, this keeps everything the user has done to
+    /// this one: the query they have typed, their mode, and — where
+    /// `is_selection` finds it again among the new items — the row under the
+    /// cursor. The search for it is linear in the number of matches, so this
+    /// suits a picker over a bounded set of items rather than a whole-tree crawl.
+    pub(super) fn replace_options(
+        &mut self,
+        options: impl IntoIterator<Item = T>,
+        is_selection: impl Fn(&T) -> bool,
+    ) {
+        // Cut off anything still streaming into the item set being replaced.
+        self.version.fetch_add(1, atomic::Ordering::Relaxed);
+        // Keep the old snapshot: it stays on screen until the new items have
+        // been matched, so the list does not blink empty in between.
+        self.matcher.restart(false);
+        // `restart` disconnects the existing injectors, so this one has to be
+        // taken afterwards.
+        let injector = self.injector();
+        for item in options {
+            if injector.push(item).is_err() {
+                break;
+            }
+        }
+        // Dropping the injector requests the redraw that shows the new items.
+        drop(injector);
+        // Match them now rather than leaving it to that redraw, so the cursor
+        // can be put back before anything is drawn.
+        self.matcher.tick(10);
+        let snapshot = self.matcher.snapshot();
+        // A `tick` that ran out of time leaves the old matches in place; the
+        // cursor then stays where it was and the next redraw clamps it.
+        let cursor = snapshot
+            .matched_items(..)
+            .position(|item| is_selection(item.data))
+            .map(|index| index as u32)
+            .unwrap_or_else(|| {
+                self.cursor
+                    .min(snapshot.matched_item_count().saturating_sub(1))
+            });
+        self.cursor = cursor;
+    }
+
     pub fn truncate_start(mut self, truncate_start: bool) -> Self {
         self.truncate_start = truncate_start;
         self
