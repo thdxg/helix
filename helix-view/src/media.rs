@@ -178,6 +178,11 @@ pub struct GraphicsState {
     pending: Vec<String>,
     /// The virtual placements already transmitted, one per image per site.
     placements: HashMap<PlacementKey, Placement>,
+    /// The images the terminal is holding, and the frame each was last drawn
+    /// in. Kept apart from the placements because the image is the expensive
+    /// half: any number of sites can place one image, and placing needs no
+    /// image data.
+    images: HashMap<u32, u64>,
     /// The placement id handed to each site, allocated on first use. Ids are
     /// carried in a cell's underline colour, so they are 24-bit, and nonzero:
     /// zero is the protocol's "unspecified", which is what we are getting away
@@ -199,13 +204,20 @@ impl GraphicsState {
         *self.sites.entry(site).or_insert(next)
     }
 
-    /// Queue a (re)transmission of `raster` as `site`'s placement unless that
-    /// placement is already this size and has been on screen continuously.
-    /// Returns the placement id to name in the placeholder cells, or `None`
-    /// when graphics are unavailable.
+    /// Queue whatever the terminal still needs to draw `raster` as `site`'s
+    /// placement: nothing, if that placement is already this size and has been
+    /// on screen continuously. Returns the placement id to name in the
+    /// placeholder cells, or `None` when graphics are unavailable.
     ///
-    /// An image that went a frame without being drawn is retransmitted rather
-    /// than reused, because by then the terminal may no longer have it: it
+    /// An image on screen -- drawn by this site or another in the frame before
+    /// this one -- is placed without being sent again (`a=p`). Sending it
+    /// again would have the terminal drop the copy it holds, read and decode
+    /// the PNG afresh and rebuild its texture, all to arrive back at the image
+    /// it already had; a second site placing the page a media view is showing
+    /// went blank in the middle of that.
+    ///
+    /// An image that went a frame with nobody drawing it is sent again rather
+    /// than placed, because by then the terminal may no longer have it: it
     /// caps its own image storage and evicts to stay under the cap, and the
     /// protocol offers no way to hear about it (we transmit with `q=2` and
     /// read no replies). Trusting the record of the transmission instead left
@@ -234,6 +246,14 @@ impl GraphicsState {
                     placement,
                 };
                 let frame = self.frame;
+                // Somebody had this image on screen as of the last frame, so
+                // the terminal is still holding it -- read before the line
+                // below records this draw.
+                let resident = self
+                    .images
+                    .get(&raster.id)
+                    .is_some_and(|used| used + 1 >= frame);
+                self.images.insert(raster.id, frame);
                 match self.placements.get_mut(&key) {
                     // `used + 1 >= frame` is "drawn in the frame before this
                     // one, or already in this one": placements are recorded
@@ -245,8 +265,11 @@ impl GraphicsState {
                         existing.used = frame
                     }
                     _ => {
-                        self.pending
-                            .push(transmit_escape(raster, placement, cols, rows));
+                        self.pending.push(if resident {
+                            place_escape(raster.id, placement, cols, rows)
+                        } else {
+                            transmit_escape(raster, placement, cols, rows)
+                        });
                         self.placements.insert(
                             key,
                             Placement {
@@ -266,28 +289,24 @@ impl GraphicsState {
     /// until at most [`MAX_LOADED_IMAGES`] remain. Images drawn this frame are
     /// never evicted, so several media splits can stay on screen at once.
     ///
-    /// Freeing an image takes every site's placement of it, so what is counted
-    /// is images rather than placements: one page shown in two sites is one
-    /// image for the terminal to hold.
+    /// Freeing an image takes every site's placement of it with it, which is
+    /// why what is counted is images rather than placements: one page shown in
+    /// two sites is one image for the terminal to hold.
     fn evict_unused(&mut self) {
-        // The newest use of each image, across the sites showing it.
-        let mut images: HashMap<u32, u64> = HashMap::new();
-        for (key, placement) in &self.placements {
-            let used = images.entry(key.image).or_insert(placement.used);
-            *used = (*used).max(placement.used);
-        }
-        if images.len() <= MAX_LOADED_IMAGES {
+        if self.images.len() <= MAX_LOADED_IMAGES {
             return;
         }
         let frame = self.frame;
-        let mut stale: Vec<(u64, u32)> = images
+        let mut stale: Vec<(u64, u32)> = self
+            .images
             .iter()
             .filter(|(_, used)| **used < frame)
             .map(|(image, used)| (*used, *image))
             .collect();
         stale.sort_unstable();
-        let excess = images.len() - MAX_LOADED_IMAGES;
+        let excess = self.images.len() - MAX_LOADED_IMAGES;
         for (_, image) in stale.into_iter().take(excess) {
+            self.images.remove(&image);
             self.placements.retain(|key, _| key.image != image);
             self.pending.push(delete_escape(image));
         }
@@ -306,6 +325,7 @@ impl GraphicsState {
     /// retransmission rather than piling up a second one.
     pub fn reset(&mut self) {
         self.placements.clear();
+        self.images.clear();
         self.pending.clear();
     }
 
@@ -368,6 +388,13 @@ fn transmit_escape(raster: &Raster, placement: u32, cols: u16, rows: u16) -> Str
         rows,
         base64(raster.png.to_string_lossy().as_bytes()),
     )
+}
+
+/// Place an image the terminal is already holding: the same virtual placement
+/// [`transmit_escape`] sets up, without the image. `a=p` carries no payload --
+/// the image is named, not sent.
+fn place_escape(image: u32, placement: u32, cols: u16, rows: u16) -> String {
+    format!("\x1b_Ga=p,U=1,q=2,i={image},p={placement},c={cols},r={rows}\x1b\\")
 }
 
 /// Free an image and all of its placements (`d=I`, uppercase: also frees the
@@ -929,7 +956,49 @@ mod tests {
         assert!(state.ensure_placement(&page, TEST_SITE, 10, 10).is_some());
         let escapes = state.take_pending();
         assert_eq!(escapes.len(), 1);
-        assert!(escapes[0].contains("i=1,"), "not a transmission of image 1");
+        assert!(
+            escapes[0].starts_with("\x1b_Ga=T,") && escapes[0].contains("i=1,"),
+            "image 1 was placed rather than sent again: {}",
+            escapes[0].escape_debug()
+        );
+    }
+
+    #[test]
+    fn an_image_on_screen_is_placed_again_without_being_sent() {
+        let mut state = GraphicsState {
+            mode: GraphicsMode::Kitty,
+            ..Default::default()
+        };
+        let page = test_raster(3);
+
+        // The media view has the page on screen ...
+        let view = state
+            .ensure_placement(&page, TEST_SITE, 40, 20)
+            .expect("placed");
+        let sent = state.take_pending();
+        assert!(sent[0].starts_with("\x1b_Ga=T,"), "the image was not sent");
+
+        // ... and a preview of the same file opens over it. The terminal is
+        // holding the image already, so it is placed, not sent: no payload,
+        // and nothing for the terminal to decode or replace.
+        let preview = state
+            .ensure_placement(&page, other_site(), 20, 10)
+            .expect("placed");
+        let escapes = state.take_pending();
+        assert_eq!(escapes.len(), 1);
+        let escape = &escapes[0];
+        assert!(
+            escape.starts_with("\x1b_Ga=p,"),
+            "the image was sent again: {}",
+            escape.escape_debug()
+        );
+        assert!(
+            escape.contains(&format!("i=3,p={preview},c=20,r=10")),
+            "not the preview's placement: {}",
+            escape.escape_debug()
+        );
+        assert!(!escape.contains(';'), "a=p carries no payload");
+        assert_ne!(view, preview);
     }
 
     fn pdf_state(page_count: Option<usize>) -> MediaState {
