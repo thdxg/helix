@@ -2,7 +2,7 @@ mod completion;
 mod document;
 pub(crate) mod editor;
 mod extension;
-mod file_explorer;
+pub(crate) mod file_explorer;
 mod info;
 pub mod lsp;
 mod markdown;
