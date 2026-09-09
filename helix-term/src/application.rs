@@ -286,6 +286,11 @@ impl Application {
     async fn render(&mut self) {
         if self.compositor.full_redraw {
             self.terminal.clear().expect("Cannot clear the terminal");
+            // A full redraw is what a reader reaches for when the screen is
+            // wrong, so it has to be able to put a media placement back too.
+            // Redrawing the placeholder cells cannot: they only point at an
+            // image, and the terminal may be missing the one they point at.
+            self.editor.graphics.reset();
             self.compositor.full_redraw = false;
         }
 

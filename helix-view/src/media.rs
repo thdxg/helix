@@ -122,7 +122,9 @@ const MAX_LOADED_IMAGES: usize = 4;
 struct Placement {
     /// (cols, rows) the virtual placement was transmitted with.
     size: (u16, u16),
-    /// Frame this image was last drawn in.
+    /// Frame this image was last drawn in. An image that has gone a frame
+    /// without being drawn is retransmitted rather than reused: see
+    /// [`GraphicsState::ensure_placement`].
     used: u64,
 }
 
@@ -143,15 +145,39 @@ pub struct GraphicsState {
 }
 
 impl GraphicsState {
-    /// Queue a (re)transmission if this raster has no placement yet or the
-    /// placement size changed. Returns false when graphics are unavailable.
+    /// Queue a (re)transmission unless this raster is already placed at this
+    /// size and has been on screen continuously. Returns false when graphics
+    /// are unavailable.
+    ///
+    /// An image that went a frame without being drawn is retransmitted rather
+    /// than reused, because by then the terminal may no longer have it: it
+    /// caps its own image storage and evicts to stay under the cap, and the
+    /// protocol offers no way to hear about it (we transmit with `q=2` and
+    /// read no replies). Trusting the record of the transmission instead left
+    /// a page you turned back to blank, permanently -- nothing about drawing
+    /// the same cells again makes the terminal fetch an image it has dropped.
+    /// [`MAX_LOADED_IMAGES`] keeps us far enough under the cap that this
+    /// should not happen, but it is a guess about a budget we cannot see, and
+    /// being wrong about it must not cost the reader their page.
+    ///
+    /// Retransmitting is a path, not pixels -- see [`transmit_escape`] -- so
+    /// this costs a short escape on the frame a page comes back, and nothing
+    /// at all while it stays on screen.
     pub fn ensure_placement(&mut self, raster: &Raster, cols: u16, rows: u16) -> bool {
         match self.mode {
             GraphicsMode::None => false,
             GraphicsMode::Kitty => {
                 let frame = self.frame;
                 match self.placements.get_mut(&raster.id) {
-                    Some(placement) if placement.size == (cols, rows) => placement.used = frame,
+                    // `used + 1 >= frame` is "drawn in the frame before this
+                    // one, or already in this one": placements are recorded
+                    // with the frame counter as it stands during the render,
+                    // which `take_pending` moves on at the end of each one.
+                    Some(placement)
+                        if placement.size == (cols, rows) && placement.used + 1 >= frame =>
+                    {
+                        placement.used = frame
+                    }
                     slot => {
                         if slot.is_some() {
                             self.placements.remove(&raster.id);
@@ -734,6 +760,34 @@ mod tests {
         }
         assert_eq!(state.placements.len(), ids.count());
         assert!(!state.take_pending().iter().any(|e| e.contains("a=d")));
+    }
+
+    #[test]
+    fn an_image_that_left_the_screen_is_retransmitted() {
+        let mut state = GraphicsState {
+            mode: GraphicsMode::Kitty,
+            ..Default::default()
+        };
+        let page = test_raster(1);
+
+        // First frame: transmitted, as nothing is placed yet.
+        assert!(state.ensure_placement(&page, 10, 10));
+        assert_eq!(state.take_pending().len(), 1);
+
+        // Held on screen: the placement is reused, frame after frame.
+        for _ in 0..3 {
+            assert!(state.ensure_placement(&page, 10, 10));
+            assert!(state.take_pending().is_empty());
+        }
+
+        // A frame goes by without it -- the reader turned the page -- and the
+        // terminal may have dropped it in the meantime, so coming back to it
+        // transmits again rather than trusting cells to be enough.
+        state.take_pending();
+        assert!(state.ensure_placement(&page, 10, 10));
+        let escapes = state.take_pending();
+        assert_eq!(escapes.len(), 1);
+        assert!(escapes[0].contains("i=1,"), "not a transmission of image 1");
     }
 
     fn pdf_state(page_count: Option<usize>) -> MediaState {
