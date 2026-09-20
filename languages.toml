@@ -5018,6 +5018,20 @@ indent = { tab-width = 2, unit = "  " }
 name = "alloy"
 source = { git = "https://github.com/mattsre/tree-sitter-alloy", rev = "58d462b1cdb077682b130caa324f3822aeb00b8e" }
 
+# Alloy 6, the modeling language (not Grafana Alloy, which is `alloy` above).
+[[language]]
+name = "als"
+scope = "source.als"
+injection-regex = "^als$"
+file-types = ["als"]
+comment-tokens = ["//", "--"]
+block-comment-tokens = { start = "/*", end = "*/" }
+indent = { tab-width = 2, unit = "  " }
+
+[[grammar]]
+name = "als"
+source = { git = "https://github.com/vincentlu/tree-sitter-alloy", rev = "7bcc865b0d12ff4f20876efd072fd1bc11faff48" }
+
 [[language]]
 name = "luau"
 scope = "source.luau"

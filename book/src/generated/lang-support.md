@@ -4,6 +4,7 @@
 | adl | ✓ | ✓ | ✓ |  |  |  |
 | agda | ✓ |  |  |  |  |  |
 | alloy | ✓ |  |  |  |  |  |
+| als | ✓ |  |  |  |  |  |
 | amber | ✓ | ✓ | ✓ | ✓ | ✓ | `amber-lsp` |
 | astro | ✓ |  |  |  |  | `astro-ls` |
 | awk | ✓ | ✓ |  |  |  | `awk-language-server` |
