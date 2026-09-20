@@ -597,6 +597,20 @@ fn build_tree_sitter_library(
     }
 
     command.args(compiler.args());
+
+    // The compiled library is loaded by looking up `tree_sitter_<grammar name>`, but the
+    // generated parser exports `tree_sitter_<name from grammar.json>`. When a grammar is
+    // registered under a different name than its author chose (for example, to keep two
+    // unrelated grammars that both call themselves `alloy` apart), rename the entry point
+    // at compile time so the library actually loads.
+    if let Some(define) = language_fn_rename(src_path, &grammar.grammar_id) {
+        if compiler.is_like_msvc() {
+            command.arg(format!("/D{define}"));
+        } else {
+            command.arg(format!("-D{define}"));
+        }
+    }
+
     // used to delay dropping the temporary object file until after the compilation is complete
     let _path_guard;
 
@@ -721,6 +735,29 @@ fn build_tree_sitter_library(
     Ok(BuildStatus::Built)
 }
 
+/// Returns a `FROM=TO` preprocessor define that renames the parser's language function
+/// when the grammar's own name (`name` in `src/grammar.json`) differs from the name it is
+/// registered under in `languages.toml`. Returns `None` when they already agree or the
+/// grammar's name cannot be determined.
+fn language_fn_rename(src_path: &Path, grammar_id: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct GrammarJson {
+        name: String,
+    }
+
+    let grammar_json = fs::read_to_string(src_path.join("grammar.json")).ok()?;
+    let internal_name = serde_json::from_str::<GrammarJson>(&grammar_json)
+        .ok()?
+        .name;
+    let external_name = grammar_id.replace('-', "_");
+    if internal_name == external_name {
+        return None;
+    }
+    Some(format!(
+        "tree_sitter_{internal_name}=tree_sitter_{external_name}"
+    ))
+}
+
 fn needs_recompile(
     lib_path: &Path,
     parser_c_path: &Path,
@@ -750,4 +787,29 @@ fn mtime(path: &Path) -> Result<SystemTime> {
 pub fn load_runtime_file(language: &str, filename: &str) -> Result<String, std::io::Error> {
     let path = crate::runtime_file(PathBuf::new().join("queries").join(language).join(filename));
     std::fs::read_to_string(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn language_fn_rename_only_when_names_differ() {
+        let dir = tempfile::tempdir().unwrap();
+        let grammar_json = dir.path().join("grammar.json");
+
+        fs::write(&grammar_json, r#"{"name": "alloy", "rules": {}}"#).unwrap();
+        assert_eq!(language_fn_rename(dir.path(), "alloy"), None);
+        assert_eq!(
+            language_fn_rename(dir.path(), "alloy6").as_deref(),
+            Some("tree_sitter_alloy=tree_sitter_alloy6")
+        );
+
+        // Hyphens in the configured name become underscores, as in the loader.
+        fs::write(&grammar_json, r#"{"name": "git_config"}"#).unwrap();
+        assert_eq!(language_fn_rename(dir.path(), "git-config"), None);
+
+        // Without a readable grammar.json nothing is renamed.
+        assert_eq!(language_fn_rename(&dir.path().join("missing"), "x"), None);
+    }
 }

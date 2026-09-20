@@ -258,7 +258,7 @@ Grammar configuration takes these keys:
 
 | Key      | Description                                                              |
 | ---      | -----------                                                              |
-| `name`   | The name of the tree-sitter grammar                                      |
+| `name`   | The name of the tree-sitter grammar. This is the name Helix uses for the compiled parser and its queries; it does not have to match the name the grammar gives itself in `grammar.js`, so two unrelated grammars that share a name can be registered side by side |
 | `source` | The method of fetching the grammar - a table with a schema defined below |
 
 Where `source` is a table with either these keys when using a grammar from a
