@@ -165,6 +165,28 @@ pub struct Buffer {
     /// The content of the buffer. The length of this Vec should always be equal to area.width *
     /// area.height
     pub content: Vec<Cell>,
+    /// Regions whose contents moved by whole rows since the previous frame, recorded with
+    /// [`Buffer::scroll_hint`] so the terminal can scroll them instead of repainting them.
+    pub scrolls: Vec<RegionScroll>,
+}
+
+/// A rectangle of the screen whose cells moved by `lines` rows between two frames.
+///
+/// Positive `lines` means the content moved up (the view scrolled forward). The frame that
+/// carries the hint already shows the scrolled result; the hint only describes how the previous
+/// frame relates to it, so the terminal can be asked to shift its existing cells the same way
+/// and only the rows that came into view need painting. Terminals that animate scrolling can
+/// then show the motion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegionScroll {
+    /// The rows and columns that move.
+    pub area: Rect,
+    /// The part of `area` whose rows are expected to line up after the shift. It is compared
+    /// against the previous frame before the hint is trusted, so a hint that miscounted rows
+    /// (virtual text the caller did not account for, say) falls back to a plain repaint.
+    pub verify: Rect,
+    /// Rows moved; positive moves content up.
+    pub lines: i32,
 }
 
 impl Buffer {
@@ -179,7 +201,11 @@ impl Buffer {
     pub fn filled(area: Rect, cell: &Cell) -> Buffer {
         let size = area.area();
         let content = vec![cell.clone(); size];
-        Buffer { area, content }
+        Buffer {
+            area,
+            content,
+            scrolls: Vec::new(),
+        }
     }
 
     /// Returns a Buffer containing the given lines
@@ -668,6 +694,102 @@ impl Buffer {
     pub fn reset(&mut self) {
         for c in &mut self.content {
             c.reset();
+        }
+        self.scrolls.clear();
+    }
+
+    /// Record that the cells inside `area` moved by `lines` rows since the previous frame
+    /// (positive: content moved up), with `verify` the part of it whose rows must line up for
+    /// the hint to be believed. Moves of no rows, or of the whole area, are dropped: there is
+    /// nothing to keep.
+    pub fn scroll_hint(&mut self, area: Rect, verify: Rect, lines: i32) {
+        if lines == 0 || lines.unsigned_abs() >= u32::from(area.height) {
+            return;
+        }
+        let verify = verify.intersection(area);
+        self.scrolls.push(RegionScroll {
+            area,
+            verify,
+            lines,
+        });
+    }
+
+    /// Remove and return the scroll hints recorded for this frame.
+    pub fn take_scroll_hints(&mut self) -> Vec<RegionScroll> {
+        std::mem::take(&mut self.scrolls)
+    }
+
+    /// Whether this (previous) frame shifted by `hint` produces the rows `next` shows: at least
+    /// half of the rows that survive the shift inside `hint.verify` must match exactly. Rows that
+    /// legitimately change on a scroll (the cursor line, a moved selection) are why it is a
+    /// majority rather than all of them.
+    pub fn scroll_hint_matches(&self, next: &Buffer, hint: &RegionScroll) -> bool {
+        if self.area != next.area {
+            return false;
+        }
+        let verify = hint.verify.intersection(self.area);
+        if verify.width == 0 || verify.height == 0 {
+            return false;
+        }
+        let width = usize::from(verify.width);
+        let (mut compared, mut matching) = (0usize, 0usize);
+        for y in verify.top()..verify.bottom() {
+            // The row in the previous frame that ends up at `y` after the shift.
+            let Some(source) = i32::from(y).checked_add(hint.lines).filter(|source| {
+                hint.area.top() as i32 <= *source && *source < hint.area.bottom() as i32
+            }) else {
+                continue;
+            };
+            let from = self.index_of(verify.x, source as u16);
+            let to = next.index_of(verify.x, y);
+            compared += 1;
+            if self.content[from..from + width] == next.content[to..to + width] {
+                matching += 1;
+            }
+        }
+        compared > 0 && matching * 2 >= compared
+    }
+
+    /// Shift the cells inside `area` by `lines` rows the way a terminal scroll region does:
+    /// positive `lines` moves content up, rows that leave the area are dropped and the rows that
+    /// enter it are blank.
+    pub fn scroll_region(&mut self, area: Rect, lines: i32) {
+        let area = area.intersection(self.area);
+        let height = usize::from(area.height);
+        if lines == 0 || area.width == 0 || height == 0 {
+            return;
+        }
+        if lines.unsigned_abs() as usize >= height {
+            self.clear(area);
+            return;
+        }
+        let width = usize::from(area.width);
+        let row = |y: usize| {
+            let start =
+                usize::from(area.x) + (usize::from(area.y) + y) * usize::from(self.area.width);
+            start..start + width
+        };
+        let count = lines.unsigned_abs() as usize;
+        if lines > 0 {
+            for y in 0..height - count {
+                let (dst, src) = (row(y), row(y + count));
+                for x in 0..width {
+                    self.content[dst.start + x] = self.content[src.start + x].clone();
+                }
+            }
+            for y in height - count..height {
+                self.content[row(y)].iter_mut().for_each(Cell::reset);
+            }
+        } else {
+            for y in (count..height).rev() {
+                let (dst, src) = (row(y), row(y - count));
+                for x in 0..width {
+                    self.content[dst.start + x] = self.content[src.start + x].clone();
+                }
+            }
+            for y in 0..count {
+                self.content[row(y)].iter_mut().for_each(Cell::reset);
+            }
         }
     }
 
@@ -1318,5 +1440,117 @@ mod tests {
 
         // Should use replacement character
         assert_eq!(&*buffer[(0, 0)].symbol, REPLACEMENT_CHARACTER.to_string());
+    }
+
+    fn rows(buffer: &Buffer) -> Vec<String> {
+        buffer
+            .content
+            .chunks(buffer.area.width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol.as_str()).collect())
+            .collect()
+    }
+
+    fn lines(lines: &[&str]) -> Buffer {
+        Buffer::with_lines(lines.to_vec())
+    }
+
+    #[test]
+    fn scroll_region_moves_rows_up_and_blanks_the_bottom() {
+        let mut buffer = lines(&["aaa", "bbb", "ccc", "ddd", "eee"]);
+        buffer.scroll_region(Rect::new(0, 1, 3, 3), 1);
+        assert_eq!(rows(&buffer), ["aaa", "ccc", "ddd", "   ", "eee"]);
+    }
+
+    #[test]
+    fn scroll_region_moves_rows_down_and_blanks_the_top() {
+        let mut buffer = lines(&["aaa", "bbb", "ccc", "ddd", "eee"]);
+        buffer.scroll_region(Rect::new(0, 1, 3, 3), -2);
+        assert_eq!(rows(&buffer), ["aaa", "   ", "   ", "bbb", "eee"]);
+    }
+
+    #[test]
+    fn scroll_region_only_touches_its_columns() {
+        let mut buffer = lines(&["ab|xy", "cd|zw", "ef|uv"]);
+        buffer.scroll_region(Rect::new(0, 0, 2, 3), 1);
+        assert_eq!(rows(&buffer), ["cd|xy", "ef|zw", "  |uv"]);
+    }
+
+    #[test]
+    fn scroll_region_of_the_whole_height_clears() {
+        let mut buffer = lines(&["aaa", "bbb"]);
+        buffer.scroll_region(Rect::new(0, 0, 3, 2), 2);
+        assert_eq!(rows(&buffer), ["   ", "   "]);
+        buffer.scroll_region(Rect::new(0, 0, 3, 2), 0);
+        assert_eq!(rows(&buffer), ["   ", "   "]);
+    }
+
+    #[test]
+    fn scroll_hint_drops_moves_that_keep_nothing() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 4));
+        let area = Rect::new(0, 0, 3, 4);
+        buffer.scroll_hint(area, area, 0);
+        buffer.scroll_hint(area, area, 4);
+        buffer.scroll_hint(area, area, -5);
+        assert!(buffer.take_scroll_hints().is_empty());
+        buffer.scroll_hint(area, area, 3);
+        assert_eq!(buffer.take_scroll_hints().len(), 1);
+        assert!(buffer.take_scroll_hints().is_empty());
+    }
+
+    #[test]
+    fn scroll_hint_matches_when_the_next_frame_is_the_shifted_previous_one() {
+        let previous = lines(&["aaa", "bbb", "ccc", "ddd", "sss"]);
+        let next = lines(&["bbb", "ccc", "ddd", "eee", "sss"]);
+        let area = Rect::new(0, 0, 3, 4);
+        let hint = RegionScroll {
+            area,
+            verify: area,
+            lines: 1,
+        };
+        assert!(previous.scroll_hint_matches(&next, &hint));
+
+        let backwards = lines(&["zzz", "aaa", "bbb", "ccc", "sss"]);
+        let hint = RegionScroll {
+            area,
+            verify: area,
+            lines: -1,
+        };
+        assert!(previous.scroll_hint_matches(&backwards, &hint));
+    }
+
+    #[test]
+    fn scroll_hint_tolerates_a_changed_row_but_not_a_wrong_count() {
+        let previous = lines(&["aaa", "bbb", "ccc", "ddd", "eee", "sss"]);
+        let area = Rect::new(0, 0, 3, 5);
+        // One of four surviving rows differs (a cursor line moved, say).
+        let next = lines(&["bbb", "CCC", "ddd", "eee", "fff", "sss"]);
+        let hint = RegionScroll {
+            area,
+            verify: area,
+            lines: 1,
+        };
+        assert!(previous.scroll_hint_matches(&next, &hint));
+        // The frame actually moved by two rows, so a one-row hint lines nothing up.
+        let next = lines(&["ccc", "ddd", "eee", "fff", "ggg", "sss"]);
+        assert!(!previous.scroll_hint_matches(&next, &hint));
+    }
+
+    #[test]
+    fn scroll_hint_verifies_only_the_verify_columns() {
+        // Gutter columns change on every scroll (relative numbers); the text columns line up.
+        let previous = lines(&["1|aaa", "2|bbb", "3|ccc", "4|ddd"]);
+        let next = lines(&["3|bbb", "2|ccc", "1|ddd", "0|eee"]);
+        let area = Rect::new(0, 0, 5, 4);
+        let hint = RegionScroll {
+            area,
+            verify: Rect::new(2, 0, 3, 4),
+            lines: 1,
+        };
+        assert!(previous.scroll_hint_matches(&next, &hint));
+        let whole = RegionScroll {
+            verify: area,
+            ..hint
+        };
+        assert!(!previous.scroll_hint_matches(&next, &whole));
     }
 }

@@ -51,6 +51,9 @@ fn vte_version() -> Option<usize> {
 struct Capabilities {
     kitty_keyboard: KittyKeyboardSupport,
     synchronized_output: bool,
+    /// DECLRMM (mode 69): scroll regions can be narrower than the screen, so a split view can
+    /// be scrolled on the terminal without disturbing its neighbours.
+    left_right_margins: bool,
     true_color: bool,
     extended_underlines: bool,
     /// OSC11 / OSC111 - change the terminal's background color.
@@ -196,6 +199,13 @@ impl TerminaBackend {
         }
 
         capabilities.extended_underlines |= config.force_enable_extended_underlines;
+        // termina drops DECRPM replies for modes it does not know, so DECLRMM cannot be
+        // queried; go by the terminal instead. kitty and alacritty have no left/right margins.
+        capabilities.left_right_margins = std::env::var_os("XTERM_VERSION").is_some()
+            || matches!(
+                term_program().as_deref(),
+                Some("ghostty" | "WezTerm" | "iTerm.app")
+            );
 
         let mut reset_cursor_command = String::new();
         if let Ok(t) = termini::TermInfo::from_env() {
@@ -607,6 +617,75 @@ impl Backend for TerminaBackend {
     fn size(&self) -> io::Result<Rect> {
         let WindowSize { rows, cols, .. } = self.terminal.get_dimensions()?;
         Ok(Rect::new(0, 0, cols, rows))
+    }
+
+    fn scroll_region(&mut self, area: Rect, lines: i32) -> io::Result<bool> {
+        let screen = self.size()?;
+        let area = area.intersection(screen);
+        if lines == 0
+            || area.width == 0
+            || area.height < 2
+            || lines.unsigned_abs() >= u32::from(area.height)
+        {
+            return Ok(false);
+        }
+        // DECSTBM alone scrolls whole rows; anything narrower needs DECSLRM.
+        let full_width = area.x == 0 && area.width == screen.width;
+        if !full_width && !self.capabilities.left_right_margins {
+            return Ok(false);
+        }
+
+        self.start_synchronized_render()?;
+        // The rows that scroll into view are erased with the current background, and the
+        // matching cells in the buffer are default ones.
+        write!(self.terminal, "{}", Csi::Sgr(csi::Sgr::Reset))?;
+        if !full_width {
+            write!(
+                self.terminal,
+                "{}{}",
+                decset!(LeftRightMarginMode),
+                Csi::Cursor(csi::Cursor::SetLeftAndRightMargins {
+                    left: OneBased::from_zero_based(area.left()),
+                    right: OneBased::from_zero_based(area.right() - 1),
+                })
+            )?;
+        }
+        let scroll = if lines > 0 {
+            csi::Edit::ScrollUp(lines as u32)
+        } else {
+            csi::Edit::ScrollDown(lines.unsigned_abs())
+        };
+        write!(
+            self.terminal,
+            "{}{}",
+            Csi::Cursor(csi::Cursor::SetTopAndBottomMargins {
+                top: OneBased::from_zero_based(area.top()),
+                bottom: OneBased::from_zero_based(area.bottom() - 1),
+            }),
+            Csi::Edit(scroll),
+        )?;
+        // Put the margins back to the whole screen. Setting them homes the cursor; the draw
+        // that follows positions it again before writing anything.
+        write!(
+            self.terminal,
+            "{}",
+            Csi::Cursor(csi::Cursor::SetTopAndBottomMargins {
+                top: OneBased::from_zero_based(0),
+                bottom: OneBased::from_zero_based(screen.height - 1),
+            })
+        )?;
+        if !full_width {
+            write!(
+                self.terminal,
+                "{}{}",
+                Csi::Cursor(csi::Cursor::SetLeftAndRightMargins {
+                    left: OneBased::from_zero_based(0),
+                    right: OneBased::from_zero_based(screen.width - 1),
+                }),
+                decreset!(LeftRightMarginMode),
+            )?;
+        }
+        Ok(true)
     }
 
     fn write_raw(&mut self, bytes: &[u8]) -> io::Result<()> {
