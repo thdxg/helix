@@ -159,7 +159,28 @@ where
 
     /// Obtains a difference between the previous and the current buffer and passes it to the
     /// current backend for drawing.
+    ///
+    /// Regions the frame reports as scrolled (see [`Buffer::scroll_hint`]) are first scrolled
+    /// on the terminal, and the previous buffer is shifted to match, so the diff only repaints
+    /// the rows that came into view. A hint the previous frame does not bear out is ignored.
     pub fn flush(&mut self) -> io::Result<()> {
+        let hints = self.buffers[self.current].take_scroll_hints();
+        if !hints.is_empty() {
+            let [first, second] = &mut self.buffers;
+            let (previous, current) = if self.current == 0 {
+                (second, first)
+            } else {
+                (first, second)
+            };
+            for hint in hints {
+                if !previous.scroll_hint_matches(current, &hint) {
+                    continue;
+                }
+                if self.backend.scroll_region(hint.area, hint.lines)? {
+                    previous.scroll_region(hint.area, hint.lines);
+                }
+            }
+        }
         let previous_buffer = &self.buffers[1 - self.current];
         let current_buffer = &self.buffers[self.current];
         let updates = previous_buffer.diff(current_buffer);

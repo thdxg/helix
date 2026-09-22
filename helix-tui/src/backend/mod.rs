@@ -58,4 +58,11 @@ pub trait Backend {
     fn window_pixel_size(&self) -> Option<(u16, u16)> {
         None
     }
+    /// Scrolls the cells inside `area` by `lines` rows on the terminal itself (positive moves
+    /// content up), leaving the rows that come into view blank, the way DECSTBM and SU/SD do.
+    /// Returns `Ok(false)` when the terminal cannot do this for `area`; nothing was written then
+    /// and the caller repaints instead.
+    fn scroll_region(&mut self, _area: Rect, _lines: i32) -> io::Result<bool> {
+        Ok(false)
+    }
 }

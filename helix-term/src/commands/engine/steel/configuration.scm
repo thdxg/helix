@@ -718,6 +718,13 @@
 ;; Number of lines to scroll at once. Defaults to 3
 (define scroll_lines helix.scroll_lines)
 
+(provide smooth_scroll)
+
+;;@doc
+;; Scroll views with the terminal's own scroll regions instead of repainting every line, so a
+;; terminal that animates scrolling can show the motion. Defaults to #t
+(define smooth_scroll helix.smooth_scroll)
+
 (provide mouse)
 
 ;;@doc

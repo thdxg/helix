@@ -205,6 +205,11 @@ impl Compositor {
                 layer.render(area, surface, cx)
             };
         }
+        // Scrolling a view on the terminal moves everything drawn over it too, so only the
+        // editor on its own may ask for it.
+        if self.layers.len() > 1 {
+            surface.take_scroll_hints();
+        }
     }
 
     pub fn cursor(&self, area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
