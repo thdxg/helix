@@ -21,7 +21,8 @@ use helix_core::{
     syntax::{self, OverlayHighlights},
     text_annotations::TextAnnotations,
     unicode::width::UnicodeWidthStr,
-    visual_offset_from_block, Change, Position, Range, Selection, Transaction,
+    visual_offset_from_anchor, visual_offset_from_block, Change, Position, Range, Selection,
+    Transaction,
 };
 use helix_view::{
     annotations::diagnostics::DiagnosticFilter,
@@ -30,9 +31,11 @@ use helix_view::{
     graphics::{Color, CursorKind, Modifier, Rect, Style},
     input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
     keyboard::{KeyCode, KeyModifiers},
+    view::ViewPosition,
     Document, DocumentId, Editor, Theme, View, ViewId,
 };
 use std::{
+    collections::HashMap,
     mem::take,
     num::NonZeroUsize,
     ops,
@@ -54,10 +57,68 @@ pub struct EditorView {
     terminal_focused: bool,
     /// When the mouse wheel last turned a media document's page.
     last_media_page: Option<Instant>,
+    /// What each view showed when it was last drawn, to tell a scroll from any other change.
+    rendered_views: HashMap<ViewId, RenderedView>,
 }
 
 /// Minimum gap between wheel-driven page turns in a media document.
 const MEDIA_SCROLL_INTERVAL: Duration = Duration::from_millis(120);
+
+/// The state a text view was drawn from, enough to tell whether the next frame of it is the
+/// same text moved by whole rows (see [`scrolled_rows`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RenderedView {
+    doc: DocumentId,
+    /// The document's change counter: an edit reflows rows, so a frame after one is not a scroll.
+    version: i32,
+    offset: ViewPosition,
+    area: Rect,
+    inner: Rect,
+}
+
+/// How many rows the text of a view moved between the frame drawn from `previous` and the one
+/// drawn from `current`, positive when it scrolled forward, if the two frames show the same text
+/// shifted by less than the view's height. `None` means the frame has to be repainted as usual:
+/// the document, its text, the view's size or its horizontal offset changed, or the anchor moved
+/// too far for any row to survive.
+///
+/// The distance is measured in visual rows, so soft-wrapped lines and inline annotations count.
+/// Virtual lines drawn by decorations (inline diagnostics) are not visible here; a miscount
+/// from those is caught when the frame is flushed, which compares the rows before scrolling.
+fn scrolled_rows(
+    doc: &Document,
+    previous: &RenderedView,
+    current: &RenderedView,
+    annotations: &TextAnnotations,
+    theme: &Theme,
+) -> Option<i32> {
+    if previous.doc != current.doc
+        || previous.version != current.version
+        || previous.area != current.area
+        || previous.inner != current.inner
+        || previous.offset.horizontal_offset != current.offset.horizontal_offset
+    {
+        return None;
+    }
+    let (from, to) = (previous.offset, current.offset);
+    if from.anchor == to.anchor && from.vertical_offset == to.vertical_offset {
+        return None;
+    }
+    let text = doc.text().slice(..);
+    let text_fmt = doc.text_format(current.inner.width, Some(theme));
+    let max_rows = usize::from(current.inner.height);
+    // Anchors sit at the start of a visual block, so the row of the later one measured from the
+    // earlier one is the number of rows between them.
+    let (first, last, sign) = if from.anchor <= to.anchor {
+        (from.anchor, to.anchor, 1)
+    } else {
+        (to.anchor, from.anchor, -1)
+    };
+    let (between, _) =
+        visual_offset_from_anchor(text, first, last, &text_fmt, annotations, max_rows).ok()?;
+    let rows = sign * between.row as i32 + to.vertical_offset as i32 - from.vertical_offset as i32;
+    (rows != 0 && (rows.unsigned_abs() as usize) < max_rows).then_some(rows)
+}
 
 #[derive(Debug, Clone)]
 pub enum InsertEvent {
@@ -81,6 +142,7 @@ impl EditorView {
             spinners: ProgressSpinners::default(),
             terminal_focused: true,
             last_media_page: None,
+            rendered_views: HashMap::new(),
         }
     }
 
@@ -89,7 +151,7 @@ impl EditorView {
     }
 
     pub fn render_view(
-        &self,
+        &mut self,
         doc_id: DocumentId,
         view_id: ViewId,
         viewport: Rect,
@@ -101,6 +163,7 @@ impl EditorView {
         let view = cx.editor.tree.get(view_id);
         let view_area = view.area;
         if doc.media.is_some() {
+            self.rendered_views.remove(&view_id);
             Self::render_media_view(doc_id, view_id, viewport, surface, cx);
         } else {
             let editor = &cx.editor;
@@ -114,6 +177,25 @@ impl EditorView {
             let view_offset = doc.view_offset(view.id);
 
             let text_annotations = view.text_annotations(doc, Some(theme));
+
+            // If this frame is the previous one moved by whole rows, let the terminal scroll
+            // the view (gutter included, statusline excluded) rather than repaint it.
+            let rendered = RenderedView {
+                doc: doc_id,
+                version: doc.version(),
+                offset: view_offset,
+                area,
+                inner,
+            };
+            if config.smooth_scroll {
+                if let Some(rows) = self.rendered_views.get(&view_id).and_then(|previous| {
+                    scrolled_rows(doc, previous, &rendered, &text_annotations, theme)
+                }) {
+                    surface.scroll_hint(area.clip_bottom(1), inner, rows);
+                }
+            }
+            self.rendered_views.insert(view_id, rendered);
+
             let mut decorations = DecorationManager::default();
 
             if is_focused && config.cursorline {
@@ -1895,6 +1977,8 @@ impl Component for EditorView {
                 .map(|(view, is_focused)| (view.id, is_focused))
                 .collect()
         };
+        self.rendered_views
+            .retain(|id, _| views.iter().any(|(view_id, _)| view_id == id));
         for (view_id, is_focused) in views {
             self.render_view(
                 cx.editor.tree.get(view_id).doc,
@@ -1909,7 +1993,9 @@ impl Component for EditorView {
         if config.auto_info {
             if let Some(mut info) = cx.editor.autoinfo.take() {
                 info.render(area, surface, cx);
-                cx.editor.autoinfo = Some(info)
+                cx.editor.autoinfo = Some(info);
+                // The popup sits over the views; scrolling them would drag it along.
+                surface.take_scroll_hints();
             }
         }
 

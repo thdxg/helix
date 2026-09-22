@@ -304,6 +304,9 @@ pub struct Config {
     pub scrolloff: usize,
     /// Number of lines to scroll at once. Defaults to 3
     pub scroll_lines: isize,
+    /// Scroll views with the terminal's own scroll regions instead of repainting every line, so
+    /// a terminal that animates scrolling can show the motion. Defaults to `true`.
+    pub smooth_scroll: bool,
     /// Mouse support. Defaults to true.
     pub mouse: bool,
     /// Which register to use for mouse yank.
@@ -1273,6 +1276,7 @@ impl Default for Config {
         Self {
             scrolloff: 5,
             scroll_lines: 3,
+            smooth_scroll: true,
             mouse: true,
             mouse_yank_register: '*',
             shell: if cfg!(windows) {

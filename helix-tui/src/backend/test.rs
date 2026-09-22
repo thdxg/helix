@@ -149,6 +149,11 @@ impl Backend for TestBackend {
         Ok(())
     }
 
+    fn scroll_region(&mut self, area: Rect, lines: i32) -> io::Result<bool> {
+        self.buffer.scroll_region(area, lines);
+        Ok(true)
+    }
+
     fn size(&self) -> Result<Rect, io::Error> {
         Ok(Rect::new(0, 0, self.width, self.height))
     }

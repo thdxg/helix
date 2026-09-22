@@ -1219,6 +1219,7 @@ fn load_configuration_api(engine: &mut Engine, generate_sources: bool) {
     module
         .register_fn_with_ctx(CONFIG, "scrolloff", HelixConfiguration::scrolloff)
         .register_fn_with_ctx(CONFIG, "scroll_lines", HelixConfiguration::scroll_lines)
+        .register_fn_with_ctx(CONFIG, "smooth_scroll", HelixConfiguration::smooth_scroll)
         .register_fn_with_ctx(CONFIG, "mouse", HelixConfiguration::mouse)
         .register_fn_with_ctx(CONFIG, "shell", HelixConfiguration::shell)
         .register_fn_with_ctx(
@@ -2784,6 +2785,12 @@ impl HelixConfiguration {
     fn scroll_lines(&self, lines: isize) {
         let mut app_config = self.load_config();
         app_config.editor.scroll_lines = lines;
+        self.store_config(app_config);
+    }
+
+    fn smooth_scroll(&self, enabled: bool) {
+        let mut app_config = self.load_config();
+        app_config.editor.smooth_scroll = enabled;
         self.store_config(app_config);
     }
 
