@@ -42,6 +42,7 @@ pub struct LanguageData {
     syntax: OnceCell<Option<SyntaxConfig>>,
     indent_query: OnceCell<Option<IndentQuery>>,
     textobject_query: OnceCell<Option<TextObjectQuery>>,
+    fold_query: OnceCell<Option<FoldQuery>>,
     tag_query: OnceCell<Option<TagQuery>>,
     rainbow_query: OnceCell<Option<RainbowQuery>>,
 }
@@ -53,6 +54,7 @@ impl Clone for LanguageData {
             syntax: OnceCell::new(),
             indent_query: OnceCell::new(),
             textobject_query: OnceCell::new(),
+            fold_query: OnceCell::new(),
             tag_query: OnceCell::new(),
             rainbow_query: OnceCell::new(),
         }
@@ -66,6 +68,7 @@ impl LanguageData {
             syntax: OnceCell::new(),
             indent_query: OnceCell::new(),
             textobject_query: OnceCell::new(),
+            fold_query: OnceCell::new(),
             tag_query: OnceCell::new(),
             rainbow_query: OnceCell::new(),
         }
@@ -172,6 +175,36 @@ impl LanguageData {
                     })
                     .ok()
                     .flatten()
+            })
+            .as_ref()
+    }
+
+    /// Compiles the folds.scm query for a language, falling back to the generic
+    /// "every node" query when the language does not ship one (see [`FoldQuery`]).
+    /// This function should only be used by this module or the xtask crate.
+    pub fn compile_fold_query(
+        grammar: Grammar,
+        config: &LanguageConfiguration,
+    ) -> Result<FoldQuery> {
+        let name = &config.language_id;
+        let text = read_query(name, "folds.scm");
+        if text.is_empty() {
+            return FoldQuery::generic(grammar)
+                .with_context(|| format!("Failed to compile the generic fold query for '{name}'"));
+        }
+        FoldQuery::new(grammar, &text)
+            .with_context(|| format!("Failed to compile folds.scm query for '{name}'"))
+    }
+
+    fn fold_query(&self, loader: &Loader) -> Option<&FoldQuery> {
+        self.fold_query
+            .get_or_init(|| {
+                let grammar = self.syntax_config(loader)?.grammar;
+                Self::compile_fold_query(grammar, &self.config)
+                    .map_err(|err| {
+                        log::error!("{err}");
+                    })
+                    .ok()
             })
             .as_ref()
     }
@@ -483,6 +516,10 @@ impl Loader {
 
     pub fn textobject_query(&self, lang: Language) -> Option<&TextObjectQuery> {
         self.language(lang).textobject_query(self)
+    }
+
+    pub fn fold_query(&self, lang: Language) -> Option<&FoldQuery> {
+        self.language(lang).fold_query(self)
     }
 
     pub fn tag_query(&self, lang: Language) -> Option<&TagQuery> {
@@ -1226,6 +1263,52 @@ pub fn child_for_byte_range<'a>(node: &Node<'a>, range: ops::Range<u32>) -> Opti
     }
 
     None
+}
+
+/// The query that decides which regions of a document can be folded (see [`crate::fold`]).
+///
+/// A language can ship a hand-written `folds.scm` whose `@fold` captures mark the foldable
+/// nodes, in the same format neovim's treesitter folding uses. Languages without one use the
+/// generic query: every named node that spans more than one line is foldable (which is also
+/// what neovim's `foldexpr` does when no `folds.scm` is available). The query is run per-layer,
+/// so injected languages are covered by their own query: a fenced code block in markdown folds
+/// like the language of the block does.
+#[derive(Debug)]
+pub struct FoldQuery {
+    pub query: Query,
+    /// The `@fold` capture of a `folds.scm`. `None` for the generic query, where every match
+    /// is a fold.
+    fold_capture: Option<Capture>,
+}
+
+impl FoldQuery {
+    const GENERIC_SRC: &'static str = "(_) @fold";
+
+    fn new(grammar: Grammar, source: &str) -> Result<Self, tree_sitter::query::ParseError> {
+        let query = Query::new(grammar, source, |_, _| Ok(()))?;
+        Ok(Self {
+            fold_capture: query.get_capture("fold"),
+            query,
+        })
+    }
+
+    fn generic(grammar: Grammar) -> Result<Self, tree_sitter::query::ParseError> {
+        let query = Query::new(grammar, Self::GENERIC_SRC, |_, _| Ok(()))?;
+        Ok(Self {
+            query,
+            fold_capture: None,
+        })
+    }
+
+    /// Whether this query was built from a `folds.scm` rather than the generic pattern.
+    pub fn is_language_specific(&self) -> bool {
+        self.fold_capture.is_some()
+    }
+
+    /// Whether a match of this query marks a foldable node.
+    pub fn is_fold(&self, capture: Capture) -> bool {
+        self.fold_capture.is_none_or(|fold| fold == capture)
+    }
 }
 
 #[derive(Debug)]

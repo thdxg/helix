@@ -254,7 +254,14 @@
 | `copy_between_registers` | Copy between two registers |  |
 | `align_view_middle` | Align view middle | normal: `` Zm ``, `` zm ``, select: `` Zm ``, `` zm `` |
 | `align_view_top` | Align view top | normal: `` Zt ``, `` zt ``, select: `` Zt ``, `` zt `` |
-| `align_view_center` | Align view center | normal: `` Zc ``, `` Zz ``, `` zc ``, `` zz ``, select: `` Zc ``, `` Zz ``, `` zc ``, `` zz `` |
+| `align_view_center` | Align view center | normal: `` Zz ``, `` zz ``, select: `` Zz ``, `` zz `` |
+| `close_fold` | Close the fold at the cursor | normal: `` Zc ``, `` zc ``, select: `` Zc ``, `` zc `` |
+| `open_fold` | Open the closed fold at the cursor | normal: `` Zo ``, `` zo ``, select: `` Zo ``, `` zo `` |
+| `toggle_fold` | Toggle the fold at the cursor | normal: `` Za ``, `` za ``, select: `` Za ``, `` za `` |
+| `close_fold_recursively` | Close all folds around the cursor | normal: `` ZC ``, `` zC ``, select: `` ZC ``, `` zC `` |
+| `open_fold_recursively` | Open the closed fold at the cursor and all folds inside of it | normal: `` ZO ``, `` zO ``, select: `` ZO ``, `` zO `` |
+| `close_all_folds` | Close all folds | normal: `` ZM ``, `` zM ``, select: `` ZM ``, `` zM `` |
+| `open_all_folds` | Open all folds | normal: `` ZR ``, `` zR ``, select: `` ZR ``, `` zR `` |
 | `align_view_bottom` | Align view bottom | normal: `` Zb ``, `` zb ``, select: `` Zb ``, `` zb `` |
 | `scroll_up` | Scroll view up | normal: `` Zk ``, `` zk ``, `` Z<up> ``, `` z<up> ``, select: `` Zk ``, `` zk ``, `` Z<up> ``, `` z<up> `` |
 | `scroll_down` | Scroll view down | normal: `` Zj ``, `` zj ``, `` Z<down> ``, `` z<down> ``, select: `` Zj ``, `` zj ``, `` Z<down> ``, `` z<down> `` |

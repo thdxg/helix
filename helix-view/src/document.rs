@@ -9,6 +9,7 @@ use helix_core::command_line::Token;
 use helix_core::diagnostic::DiagnosticProvider;
 use helix_core::doc_formatter::TextFormat;
 use helix_core::encoding::Encoding;
+use helix_core::fold::{self, FoldSpan, Folds};
 use helix_core::snippets::{ActiveSnippet, SnippetRenderCtx};
 use helix_core::syntax::config::LanguageServerFeature;
 use helix_core::text_annotations::{InlineAnnotation, Overlay};
@@ -30,12 +31,13 @@ use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::SystemTime;
 
 use helix_core::{
     editor_config::EditorConfig,
     encoding,
+    graphemes::next_grapheme_boundary,
     history::{History, State, UndoKind},
     indent::{auto_detect_indent_style, IndentStyle},
     line_ending::auto_detect_line_ending,
@@ -157,6 +159,12 @@ pub struct Document {
     pub(crate) document_highlights: HashMap<ViewId, DocumentHighlights>,
     /// LSP code action hints for each view.
     pub(crate) code_action_hints: HashSet<ViewId>,
+    /// The closed folds of the document, per view (like vim/neovim, splits of the same
+    /// document can have different folds).
+    folds: HashMap<ViewId, Folds>,
+    /// Cache of `fold_spans()`. Computing it walks the whole syntax tree, so it is invalidated
+    /// (see `apply_impl`) rather than recomputed on every fold command.
+    fold_spans_cache: Option<Vec<FoldSpan>>,
     /// Set to `true` when the document is updated, reset to `false` on the next inlay hints
     /// update from the LSP
     pub inlay_hints_oudated: bool,
@@ -794,6 +802,8 @@ impl Document {
             jump_labels: HashMap::new(),
             document_highlights: HashMap::new(),
             code_action_hints: HashSet::new(),
+            folds: HashMap::new(),
+            fold_spans_cache: None,
             color_swatches: None,
             document_links: Vec::new(),
             color_swatch_controller: TaskController::new(),
@@ -1443,6 +1453,7 @@ impl Document {
                 })
                 .ok()
         });
+        self.fold_spans_cache = None;
     }
 
     /// Set the programming language for the file if you know the language but don't have the
@@ -1465,10 +1476,131 @@ impl Document {
         // TODO: use a transaction?
         self.selections
             .insert(view_id, selection.ensure_invariants(self.text().slice(..)));
+        self.reveal_folded_cursors(view_id);
         helix_event::dispatch(SelectionDidChange {
             doc: self,
             view: view_id,
         })
+    }
+
+    /// The closed folds of `view_id`. Like the selection, folds are per-view: splits of this
+    /// document can have different folds, matching vim/neovim (`:help fold-behavior`).
+    pub fn folds(&self, view_id: ViewId) -> &Folds {
+        static EMPTY: OnceLock<Folds> = OnceLock::new();
+        self.folds
+            .get(&view_id)
+            .unwrap_or_else(|| EMPTY.get_or_init(Folds::default))
+    }
+
+    /// Sets the closed folds of `view_id`, replacing whatever it had. Used to carry folds over
+    /// to a new view when splitting, the same way the selection and scroll offset already are.
+    pub fn set_folds(&mut self, view_id: ViewId, folds: Folds) {
+        self.folds.insert(view_id, folds);
+    }
+
+    /// Computes the regions of the document that can be folded.
+    ///
+    /// These are every named tree-sitter node that spans more than one line, which needs no
+    /// language-specific configuration. Documents without a syntax tree fall back to folding by
+    /// indentation. This walks the whole syntax tree, so the result is cached until the next
+    /// edit (see `apply_impl`) rather than recomputed on every call.
+    pub fn fold_spans(&mut self) -> Vec<FoldSpan> {
+        if self.fold_spans_cache.is_none() {
+            let text = self.text.slice(..);
+            let spans = match &self.syntax {
+                Some(syntax) => fold::tree_sitter_spans(syntax, text, &self.syn_loader.load()),
+                None => fold::indent_spans(text, self.tab_width()),
+            };
+            self.fold_spans_cache = Some(spans);
+        }
+        self.fold_spans_cache.as_ref().unwrap().clone()
+    }
+
+    /// Closes the given folds in `view_id`. Cursors that end up hidden are moved to the header
+    /// of the fold.
+    pub fn close_folds(&mut self, view_id: ViewId, spans: impl IntoIterator<Item = FoldSpan>) {
+        let text = self.text.slice(..);
+        if self
+            .folds
+            .entry(view_id)
+            .or_default()
+            .close_all(text, spans)
+        {
+            self.move_cursor_out_of_folds(view_id);
+        }
+    }
+
+    /// Opens the given folds in `view_id`.
+    pub fn open_folds(&mut self, view_id: ViewId, spans: impl IntoIterator<Item = FoldSpan>) {
+        let folds = self.folds.entry(view_id).or_default();
+        for span in spans {
+            folds.open(span);
+        }
+    }
+
+    /// Opens all folds inside of `span` in `view_id`, including `span` itself. Returns whether
+    /// any fold was open before.
+    pub fn open_folds_within(&mut self, view_id: ViewId, span: FoldSpan) -> bool {
+        self.folds.entry(view_id).or_default().open_within(span)
+    }
+
+    pub fn open_all_folds(&mut self, view_id: ViewId) {
+        if let Some(folds) = self.folds.get_mut(&view_id) {
+            folds.open_all();
+        }
+    }
+
+    /// Moves `view_id`'s cursors that are hidden inside one of its folds onto the fold's header.
+    ///
+    /// A range that is just a block cursor (spans exactly one grapheme) moves entirely, like
+    /// `reveal_folded_cursors`. A wider, actively extended selection keeps its anchor in place
+    /// and only its cursor side moves, the same as any other cursor-relocating motion.
+    fn move_cursor_out_of_folds(&mut self, view_id: ViewId) {
+        let (Some(folds), Some(old_selection)) =
+            (self.folds.get(&view_id), self.selections.get(&view_id))
+        else {
+            return;
+        };
+        let text = self.text.slice(..);
+        let old_selection = old_selection.clone();
+        let new_selection = old_selection
+            .clone()
+            .transform(|range| {
+                let cursor = range.cursor(text);
+                let pos = folds.visible_pos(text, cursor);
+                if pos == cursor {
+                    range
+                } else if next_grapheme_boundary(text, range.from()) == range.to() {
+                    Range::point(pos)
+                } else {
+                    Range::new(range.anchor, pos)
+                }
+            })
+            .ensure_invariants(text);
+
+        if new_selection != old_selection {
+            self.selections.insert(view_id, new_selection);
+            helix_event::dispatch(SelectionDidChange {
+                doc: self,
+                view: view_id,
+            });
+        }
+    }
+
+    /// Cursors are never hidden: a fold is opened when the cursor of `view_id` moves into it.
+    fn reveal_folded_cursors(&mut self, view_id: ViewId) {
+        let Some(folds) = self.folds.get_mut(&view_id) else {
+            return;
+        };
+        if folds.is_empty() {
+            return;
+        }
+        let text = self.text.slice(..);
+        if let Some(selection) = self.selections.get(&view_id) {
+            for range in selection {
+                folds.reveal(range.cursor(text));
+            }
+        }
     }
 
     /// Find the origin selection of the text in a document, i.e. where
@@ -1514,6 +1646,7 @@ impl Document {
         self.document_highlight_controllers.remove(&view_id);
         self.code_action_hints.remove(&view_id);
         self.code_action_controllers.remove(&view_id);
+        self.folds.remove(&view_id);
     }
 
     /// Apply a [`Transaction`] to the [`Document`] to change its text.
@@ -1562,6 +1695,12 @@ impl Document {
                 .changes()
                 .map_pos(view_data.view_position.anchor, Assoc::Before);
         }
+
+        let new_text = self.text.slice(..);
+        for folds in self.folds.values_mut() {
+            folds.map(new_text, changes);
+        }
+        self.fold_spans_cache = None;
 
         // generate revert to savepoint
         if !self.savepoints.is_empty() {
@@ -1701,6 +1840,15 @@ impl Document {
                 view_id,
                 selection.clone().ensure_invariants(self.text.slice(..)),
             );
+        }
+
+        // An edit (or undo) can put a cursor into a fold, for example by inserting text there
+        let view_ids: Vec<_> = self.selections.keys().copied().collect();
+        for view_id in view_ids {
+            self.reveal_folded_cursors(view_id);
+        }
+
+        if transaction.selection().is_some() {
             helix_event::dispatch(SelectionDidChange {
                 doc: self,
                 view: view_id,

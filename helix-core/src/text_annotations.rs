@@ -5,6 +5,7 @@ use std::ops::Range;
 use std::ptr::NonNull;
 
 use crate::doc_formatter::FormattedGrapheme;
+use crate::fold::FoldedRange;
 use crate::syntax::{Highlight, OverlayHighlights};
 use crate::{Position, Tendril};
 
@@ -279,6 +280,11 @@ pub struct TextAnnotations<'a> {
     inline_annotations: Vec<Layer<'a, InlineAnnotation, Option<Highlight>>>,
     overlays: Vec<Layer<'a, Overlay, Option<Highlight>>>,
     line_annotations: Vec<(Cell<usize>, RawBox<dyn LineAnnotation + 'a>)>,
+    /// Closed folds, sorted and non-overlapping. See [`TextAnnotations::add_folds`].
+    folds: &'a [FoldedRange],
+    /// Index of the next fold the formatter has not passed yet
+    fold_idx: Cell<usize>,
+    fold_highlight: Option<Highlight>,
 }
 
 impl Debug for TextAnnotations<'_> {
@@ -286,6 +292,7 @@ impl Debug for TextAnnotations<'_> {
         f.debug_struct("TextAnnotations")
             .field("inline_annotations", &self.inline_annotations)
             .field("overlays", &self.overlays)
+            .field("folds", &self.folds)
             .finish_non_exhaustive()
     }
 }
@@ -298,6 +305,8 @@ impl<'a> TextAnnotations<'a> {
         for (next_anchor, layer) in &self.line_annotations {
             next_anchor.set(unsafe { layer.get().reset_pos(char_idx) });
         }
+        self.fold_idx
+            .set(self.folds.partition_point(|fold| fold.start < char_idx));
     }
 
     pub fn collect_overlay_highlights(&self, char_range: Range<usize>) -> OverlayHighlights {
@@ -364,6 +373,56 @@ impl<'a> TextAnnotations<'a> {
         self
     }
 
+    /// Add closed folds.
+    ///
+    /// The text of a fold (`FoldedRange::start..FoldedRange::end`) is not displayed: it is
+    /// collapsed into the line ending of the fold's header line, which is preceded by the
+    /// fold's placeholder text rendered with `highlight` patched on top of `ui.text`.
+    /// Everything that is anchored inside the hidden text is skipped.
+    ///
+    /// The folds **must be sorted** and **must not overlap**.
+    pub fn add_folds(
+        &mut self,
+        folds: &'a [FoldedRange],
+        highlight: Option<Highlight>,
+    ) -> &mut Self {
+        self.folds = folds;
+        self.fold_highlight = highlight;
+        self
+    }
+
+    pub fn has_folds(&self) -> bool {
+        !self.folds.is_empty()
+    }
+
+    /// Returns the document line that is displayed where `line` would be: `line` itself
+    /// unless the line is hidden by a fold, in which case that is the fold's header.
+    pub fn visible_line(&self, line: usize) -> usize {
+        let idx = self.folds.partition_point(|fold| fold.last_line < line);
+        match self.folds.get(idx) {
+            Some(fold) if fold.header_line < line => fold.header_line,
+            _ => line,
+        }
+    }
+
+    /// Returns the line that is displayed directly after the (visible) `line`, skipping
+    /// lines that are hidden by a fold.
+    pub fn next_visible_line(&self, line: usize) -> usize {
+        let line = self.visible_line(line);
+        let idx = self.folds.partition_point(|fold| fold.header_line < line);
+        match self.folds.get(idx) {
+            Some(fold) if fold.header_line == line => fold.last_line + 1,
+            _ => line + 1,
+        }
+    }
+
+    /// Returns the line that is displayed directly before `line`, skipping
+    /// lines that are hidden by a fold. Returns `None` for the first line.
+    pub fn prev_visible_line(&self, line: usize) -> Option<usize> {
+        let line = self.visible_line(line);
+        Some(self.visible_line(line.checked_sub(1)?))
+    }
+
     /// Removes all line annotations, useful for vertical motions
     /// so that virtual text lines are automatically skipped.
     pub fn clear_line_annotations(&mut self) {
@@ -378,6 +437,34 @@ impl<'a> TextAnnotations<'a> {
             let annotation = layer.consume(char_idx, |annot| annot.char_idx)?;
             Some((annotation, layer.metadata))
         })
+    }
+
+    /// Returns the fold that starts at `char_idx` (the line ending of the fold's header line).
+    ///
+    /// Must be called with monotonically increasing `char_idx`, the same as for other
+    /// annotations.
+    pub(crate) fn fold_at(&self, char_idx: usize) -> Option<&FoldedRange> {
+        let mut idx = self.fold_idx.get();
+        while self
+            .folds
+            .get(idx)
+            .is_some_and(|fold| fold.start < char_idx)
+        {
+            idx += 1;
+        }
+        self.fold_idx.set(idx);
+        self.folds.get(idx).filter(|fold| fold.start == char_idx)
+    }
+
+    pub(crate) fn fold_highlight(&self) -> Option<Highlight> {
+        self.fold_highlight
+    }
+
+    /// Skips all annotations that are anchored before `char_idx`.
+    /// Used when the formatter jumps over hidden text.
+    pub(crate) fn skip_layers_to(&self, char_idx: usize) {
+        reset_pos(&self.inline_annotations, char_idx, |annot| annot.char_idx);
+        reset_pos(&self.overlays, char_idx, |annot| annot.char_idx);
     }
 
     pub(crate) fn overlay_at(&self, char_idx: usize) -> Option<(&Overlay, Option<Highlight>)> {

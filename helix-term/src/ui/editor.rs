@@ -71,6 +71,8 @@ struct RenderedView {
     doc: DocumentId,
     /// The document's change counter: an edit reflows rows, so a frame after one is not a scroll.
     version: i32,
+    /// The view's fold revision: opening or closing a fold reflows rows as well.
+    folds: u64,
     offset: ViewPosition,
     area: Rect,
     inner: Rect,
@@ -94,6 +96,7 @@ fn scrolled_rows(
 ) -> Option<i32> {
     if previous.doc != current.doc
         || previous.version != current.version
+        || previous.folds != current.folds
         || previous.area != current.area
         || previous.inner != current.inner
         || previous.offset.horizontal_offset != current.offset.horizontal_offset
@@ -183,6 +186,7 @@ impl EditorView {
             let rendered = RenderedView {
                 doc: doc_id,
                 version: doc.version(),
+                folds: doc.folds(view_id).revision(),
                 offset: view_offset,
                 area,
                 inner,
