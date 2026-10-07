@@ -122,6 +122,8 @@ enum DiffProvider {
     None,
 }
 
+// Without the `git` feature every method is a stub and its parameters go unused.
+#[cfg_attr(not(feature = "git"), allow(unused_variables))]
 impl DiffProvider {
     pub fn needs_reload(&self, fs_event: &helix_core::file_watcher::Event) -> bool {
         match self {
