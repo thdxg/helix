@@ -30,6 +30,7 @@ use helix_core::{
     comment,
     doc_formatter::TextFormat,
     encoding, find_workspace,
+    fold::{spans_containing_line, FoldSpan, Folds},
     graphemes::{self, next_grapheme_boundary},
     history::UndoKind,
     increment,
@@ -579,6 +580,13 @@ impl MappableCommand {
         align_view_middle, "Align view middle",
         align_view_top, "Align view top",
         align_view_center, "Align view center",
+        close_fold, "Close the fold at the cursor",
+        open_fold, "Open the closed fold at the cursor",
+        toggle_fold, "Toggle the fold at the cursor",
+        close_fold_recursively, "Close all folds around the cursor",
+        open_fold_recursively, "Open the closed fold at the cursor and all folds inside of it",
+        close_all_folds, "Close all folds",
+        open_all_folds, "Open all folds",
         align_view_bottom, "Align view bottom",
         scroll_up, "Scroll view up",
         scroll_down, "Scroll view down",
@@ -6235,6 +6243,7 @@ fn split(editor: &mut Editor, action: Action) {
     let id = doc.id();
     let selection = doc.selection(view.id).clone();
     let offset = doc.view_offset(view.id);
+    let folds = doc.folds(view.id).clone();
 
     editor.switch(id, action);
 
@@ -6244,6 +6253,8 @@ fn split(editor: &mut Editor, action: Action) {
     // match the view scroll offset (switch doesn't handle this fully
     // since the selection is only matched after the split)
     doc.set_view_offset(view.id, offset);
+    // match the folds too, like vim/neovim do when splitting a window
+    doc.set_folds(view.id, folds);
 }
 
 fn hsplit(cx: &mut Context) {
@@ -6363,6 +6374,124 @@ fn copy_between_registers(cx: &mut Context) {
             }
         });
     });
+}
+
+/// The document lines of all cursors of the current selection.
+fn cursor_lines(doc: &Document, view_id: ViewId) -> Vec<usize> {
+    let text = doc.text().slice(..);
+    let mut lines: Vec<_> = doc
+        .selection(view_id)
+        .iter()
+        .map(|range| text.char_to_line(range.cursor(text)))
+        .collect();
+    lines.dedup();
+    lines
+}
+
+/// The fold that `close_fold` closes for a cursor on `line`: the innermost fold around the line
+/// that is still open. When the cursor is on the header of a closed fold this is the fold
+/// that contains the closed one.
+fn fold_to_close(folds: &Folds, spans: &[FoldSpan], line: usize) -> Option<FoldSpan> {
+    spans_containing_line(spans, line)
+        .rev()
+        .find(|span| !folds.is_closed(*span))
+}
+
+fn close_fold_impl(cx: &mut Context, toggle: bool) {
+    let (view, doc) = current!(cx.editor);
+    let spans = doc.fold_spans();
+    let folds = doc.folds(view.id);
+    let mut to_close = Vec::new();
+    let mut to_open = Vec::new();
+    for line in cursor_lines(doc, view.id) {
+        match folds.folded_at_header(line) {
+            Some(fold) if toggle => to_open.push(fold.span()),
+            _ => to_close.extend(fold_to_close(folds, &spans, line)),
+        }
+    }
+    if to_close.is_empty() && to_open.is_empty() {
+        cx.editor.set_status("No fold found");
+        return;
+    }
+    doc.open_folds(view.id, to_open);
+    doc.close_folds(view.id, to_close);
+}
+
+fn close_fold(cx: &mut Context) {
+    close_fold_impl(cx, false)
+}
+
+fn toggle_fold(cx: &mut Context) {
+    close_fold_impl(cx, true)
+}
+
+fn open_fold_impl(cx: &mut Context, recursive: bool) {
+    let (view, doc) = current!(cx.editor);
+    let spans = doc.fold_spans();
+    let view_id = view.id;
+    let mut found = false;
+    for line in cursor_lines(doc, view_id) {
+        if let Some(span) = doc
+            .folds(view_id)
+            .folded_at_header(line)
+            .map(|fold| fold.span())
+        {
+            found = true;
+            if recursive {
+                doc.open_folds_within(view_id, span);
+            } else {
+                doc.open_folds(view_id, [span]);
+            }
+        } else if recursive {
+            // the cursor's line is not itself a fold header, so it must be visible: every fold
+            // that contains it is already open. Open the closed folds nested inside of the
+            // innermost of those (the section/block the cursor is directly in), if any.
+            if let Some(span) = spans_containing_line(&spans, line).next_back() {
+                found |= doc.open_folds_within(view_id, span);
+            }
+        }
+    }
+    if !found {
+        cx.editor.set_status("No closed fold found");
+    }
+}
+
+fn open_fold(cx: &mut Context) {
+    open_fold_impl(cx, false)
+}
+
+fn open_fold_recursively(cx: &mut Context) {
+    open_fold_impl(cx, true)
+}
+
+fn close_fold_recursively(cx: &mut Context) {
+    let (view, doc) = current!(cx.editor);
+    let spans = doc.fold_spans();
+    let to_close: Vec<_> = cursor_lines(doc, view.id)
+        .into_iter()
+        .flat_map(|line| spans_containing_line(&spans, line))
+        .collect();
+    if to_close.is_empty() {
+        cx.editor.set_status("No fold found");
+        return;
+    }
+    doc.close_folds(view.id, to_close);
+}
+
+fn close_all_folds(cx: &mut Context) {
+    let (view, doc) = current!(cx.editor);
+    let view_id = view.id;
+    let spans = doc.fold_spans();
+    if spans.is_empty() {
+        cx.editor.set_status("No fold found");
+        return;
+    }
+    doc.close_folds(view_id, spans);
+}
+
+fn open_all_folds(cx: &mut Context) {
+    let (view, doc) = current!(cx.editor);
+    doc.open_all_folds(view.id);
 }
 
 fn align_view_top(cx: &mut Context) {

@@ -114,7 +114,7 @@ pub fn move_vertically(
 ) -> Range {
     annotations.clear_line_annotations();
     let pos = range.cursor(slice);
-    let line_idx = slice.char_to_line(pos);
+    let line_idx = annotations.visible_line(slice.char_to_line(pos));
     let line_start = slice.line_to_char(line_idx);
 
     // Compute the current position's 2d coordinates.
@@ -123,18 +123,37 @@ pub fn move_vertically(
         .old_visual_position
         .map_or((visual_pos.row as u32, visual_pos.col as u32), |pos| pos);
     new_row = new_row.max(visual_pos.row as u32);
-    let line_idx = slice.char_to_line(pos);
 
     // Compute the new position.
-    let mut new_line_idx = match dir {
-        Direction::Forward => line_idx.saturating_add(count),
-        Direction::Backward => line_idx.saturating_sub(count),
+    let last_line_idx = slice.len_lines() - 1;
+    let mut new_line_idx = if annotations.has_folds() {
+        // lines hidden by a fold are not moved over one by one, they count as a single line
+        let mut new_line_idx = line_idx;
+        for _ in 0..count {
+            new_line_idx = match dir {
+                Direction::Forward => annotations.next_visible_line(new_line_idx),
+                Direction::Backward => match annotations.prev_visible_line(new_line_idx) {
+                    Some(line_idx) => line_idx,
+                    None => break,
+                },
+            };
+            if new_line_idx >= last_line_idx {
+                break;
+            }
+        }
+        // the last line might be hidden inside of a fold
+        annotations.visible_line(new_line_idx.min(last_line_idx))
+    } else {
+        match dir {
+            Direction::Forward => line_idx.saturating_add(count),
+            Direction::Backward => line_idx.saturating_sub(count),
+        }
     };
 
-    let line = if new_line_idx >= slice.len_lines() - 1 {
+    let line = if new_line_idx >= last_line_idx {
         // there is no line terminator for the last line
         // so the logic below is not necessary here
-        new_line_idx = slice.len_lines() - 1;
+        new_line_idx = last_line_idx;
         slice
     } else {
         // char_idx_at_visual_block_offset returns a one-past-the-end index
@@ -743,6 +762,82 @@ mod test {
             ),
             (1, 3).into()
         );
+    }
+
+    #[test]
+    fn test_vertical_move_over_folds() {
+        use crate::fold::{FoldSpan, Folds};
+
+        let text = Rope::from("aaaa\nbbbb\ncccc\ndddd\neeee\nffff");
+        let slice = text.slice(..);
+        let mut folds = Folds::default();
+        // `bbbb` is the header of a fold that hides `cccc` and `dddd`
+        folds.close(slice, FoldSpan::new(1, 3).unwrap());
+        let mut annotations = TextAnnotations::default();
+        annotations.add_folds(folds.folded(), None);
+        let text_fmt = TextFormat::default();
+
+        let mut line_after_moves = |start_line: usize, dir: Direction, counts: &[usize]| {
+            let pos = pos_at_coords(slice, (start_line, 2).into(), true);
+            let mut range = Range::point(pos);
+            let mut lines = Vec::new();
+            for &count in counts {
+                range = move_vertically(
+                    slice,
+                    range,
+                    dir,
+                    count,
+                    Movement::Move,
+                    &text_fmt,
+                    &mut annotations,
+                );
+                lines.push(coords_at_pos(slice, range.cursor(slice)).row);
+            }
+            lines
+        };
+
+        // down: aaaa -> bbbb (folded) -> eeee -> ffff -> ffff
+        assert_eq!(
+            line_after_moves(0, Direction::Forward, &[1, 1, 1, 1]),
+            [1, 4, 5, 5]
+        );
+        // a count skips a fold like a single line
+        assert_eq!(line_after_moves(0, Direction::Forward, &[2]), [4]);
+        assert_eq!(line_after_moves(0, Direction::Forward, &[3]), [5]);
+        assert_eq!(line_after_moves(0, Direction::Forward, &[usize::MAX]), [5]);
+        // up: ffff -> eeee -> bbbb (folded) -> aaaa -> aaaa
+        assert_eq!(
+            line_after_moves(5, Direction::Backward, &[1, 1, 1, 1]),
+            [4, 1, 0, 0]
+        );
+        assert_eq!(line_after_moves(5, Direction::Backward, &[2]), [1]);
+        assert_eq!(line_after_moves(5, Direction::Backward, &[usize::MAX]), [0]);
+    }
+
+    #[test]
+    fn test_vertical_move_onto_fold_at_end_of_text() {
+        use crate::fold::{FoldSpan, Folds};
+
+        // the fold hides the last line
+        let text = Rope::from("aaaa\nbbbb\ncccc\ndddd");
+        let slice = text.slice(..);
+        let mut folds = Folds::default();
+        folds.close(slice, FoldSpan::new(1, 3).unwrap());
+        let mut annotations = TextAnnotations::default();
+        annotations.add_folds(folds.folded(), None);
+
+        let range = Range::point(pos_at_coords(slice, (0, 2).into(), true));
+        let range = move_vertically(
+            slice,
+            range,
+            Direction::Forward,
+            10,
+            Movement::Move,
+            &TextFormat::default(),
+            &mut annotations,
+        );
+        // the fold's header, not one of the hidden lines
+        assert_eq!(coords_at_pos(slice, range.cursor(slice)).row, 1);
     }
 
     #[test]

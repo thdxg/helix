@@ -38,6 +38,7 @@ pub mod tasks {
             let grammar = syntax_config.grammar;
             LanguageData::compile_indent_query(grammar, config)?;
             LanguageData::compile_textobject_query(grammar, config)?;
+            LanguageData::compile_fold_query(grammar, config)?;
             LanguageData::compile_tag_query(grammar, config)?;
             LanguageData::compile_rainbow_query(grammar, config)?;
         }

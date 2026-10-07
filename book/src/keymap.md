@@ -198,18 +198,32 @@ normal mode) is persistent and can be exited using the escape key. This is
 useful when you're simply looking over text and not actively editing it.
 
 
-| Key                  | Description                                               | Command                 |
-| -----                | -----------                                               | -------                 |
-| `z`, `c`             | Vertically center the line                                | `align_view_center`     |
-| `t`                  | Align the line to the top of the screen                   | `align_view_top`        |
-| `b`                  | Align the line to the bottom of the screen                | `align_view_bottom`     |
-| `m`                  | Align the line to the middle of the screen (horizontally) | `align_view_middle`     |
-| `j`, `down`          | Scroll the view downwards                                 | `scroll_down`           |
-| `k`, `up`            | Scroll the view upwards                                   | `scroll_up`             |
-| `Ctrl-f`, `PageDown` | Move page down                                            | `page_down`             |
-| `Ctrl-b`, `PageUp`   | Move page up                                              | `page_up`               |
-| `Ctrl-u`             | Move cursor and page half page up                         | `page_cursor_half_up`   |
-| `Ctrl-d`             | Move cursor and page half page down                       | `page_cursor_half_down` |
+| Key                  | Description                                                | Command                  |
+| -------------------- | ---------------------------------------------------------- | ------------------------ |
+| `z`                  | Vertically center the line                                 | `align_view_center`      |
+| `t`                  | Align the line to the top of the screen                    | `align_view_top`         |
+| `b`                  | Align the line to the bottom of the screen                 | `align_view_bottom`      |
+| `m`                  | Align the line to the middle of the screen (horizontally)  | `align_view_middle`      |
+| `j`, `down`          | Scroll the view downwards                                  | `scroll_down`            |
+| `k`, `up`            | Scroll the view upwards                                    | `scroll_up`              |
+| `Ctrl-f`, `PageDown` | Move page down                                             | `page_down`              |
+| `Ctrl-b`, `PageUp`   | Move page up                                               | `page_up`                |
+| `Ctrl-u`             | Move cursor and page half page up                          | `page_cursor_half_up`    |
+| `Ctrl-d`             | Move cursor and page half page down                        | `page_cursor_half_down`  |
+| `c`                  | Close the innermost open fold around the cursor            | `close_fold`             |
+| `o`                  | Open the closed fold at the cursor                         | `open_fold`              |
+| `a`                  | Toggle the fold at the cursor                              | `toggle_fold`            |
+| `C`                  | Close all folds around the cursor, recursively             | `close_fold_recursively` |
+| `O`                  | Open the closed fold at the cursor and all folds inside it | `open_fold_recursively`  |
+| `M`                  | Close all folds in the document                            | `close_all_folds`        |
+| `R`                  | Open all folds in the document                             | `open_all_folds`         |
+
+Folding works in every buffer. For any language with a tree-sitter grammar,
+fold regions (functions, blocks, markdown sections and list items, etc.) are
+derived from the syntax tree: languages that ship a `folds.scm` query decide
+which nodes fold, every other language folds any node that spans multiple
+lines. Buffers without a syntax tree fall back to folding by indentation.
+Folds are per-view and a fold opens automatically when the cursor moves into it.
 
 #### Goto mode
 

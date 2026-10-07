@@ -462,6 +462,15 @@ impl View {
     ) -> TextAnnotations<'a> {
         let mut text_annotations = TextAnnotations::default();
 
+        let folds = doc.folds(self.id);
+        if !folds.is_empty() {
+            let style = theme.and_then(|t| {
+                t.find_highlight("ui.virtual.fold")
+                    .or_else(|| t.find_highlight("comment"))
+            });
+            text_annotations.add_folds(folds.folded(), style);
+        }
+
         if let Some(labels) = doc.jump_labels.get(&self.id) {
             let style = theme.and_then(|t| t.find_highlight("ui.virtual.jump-label"));
             text_annotations.add_overlay(labels, style);

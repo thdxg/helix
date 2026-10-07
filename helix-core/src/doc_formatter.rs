@@ -22,6 +22,7 @@ use unicode_segmentation::{Graphemes, UnicodeSegmentation};
 use helix_stdx::rope::{RopeGraphemes, RopeSliceExt};
 
 use crate::graphemes::{Grapheme, GraphemeStr};
+use crate::line_ending::LineEnding;
 use crate::syntax::Highlight;
 use crate::text_annotations::TextAnnotations;
 use crate::{Position, RopeSlice};
@@ -174,6 +175,7 @@ impl Default for TextFormat {
 
 #[derive(Debug)]
 pub struct DocumentFormatter<'t> {
+    text: RopeSlice<'t>,
     text_fmt: &'t TextFormat,
     annotations: &'t TextAnnotations<'t>,
 
@@ -187,6 +189,11 @@ pub struct DocumentFormatter<'t> {
     exhausted: bool,
 
     inline_annotation_graphemes: Option<(Graphemes<'t>, Option<Highlight>)>,
+
+    /// The placeholder of a fold that is currently being yielded
+    fold_placeholder: Option<(Graphemes<'t>, Option<Highlight>)>,
+    /// The `char_pos` at which the placeholder of a fold was already yielded
+    fold_placeholder_pos: usize,
 
     // softwrap specific
     /// The indentation of the current line
@@ -216,10 +223,13 @@ impl<'t> DocumentFormatter<'t> {
     ) -> Self {
         // TODO divide long lines into blocks to avoid bad performance for long lines
         let block_line_idx = text.char_to_line(char_idx.min(text.len_chars()));
+        // A line that is hidden by a fold is displayed as a part of the fold's header
+        let block_line_idx = annotations.visible_line(block_line_idx);
         let block_char_idx = text.line_to_char(block_line_idx);
         annotations.reset_pos(block_char_idx);
 
         DocumentFormatter {
+            text,
             text_fmt,
             annotations,
             visual_pos: Position { row: 0, col: 0 },
@@ -232,6 +242,8 @@ impl<'t> DocumentFormatter<'t> {
             word_i: 0,
             line_pos: block_line_idx,
             inline_annotation_graphemes: None,
+            fold_placeholder: None,
+            fold_placeholder_pos: usize::MAX,
         }
     }
 
@@ -261,32 +273,74 @@ impl<'t> DocumentFormatter<'t> {
         }
     }
 
-    fn advance_grapheme(&mut self, col: usize, char_pos: usize) -> Option<GraphemeWithSource<'t>> {
-        let (grapheme, source) =
-            if let Some((grapheme, highlight)) = self.next_inline_annotation_grapheme(char_pos) {
-                (grapheme.into(), GraphemeSource::VirtualText { highlight })
-            } else if let Some(grapheme) = self.graphemes.next() {
-                let codepoints = grapheme.len_chars() as u32;
-
-                let overlay = self.annotations.overlay_at(char_pos);
-                let grapheme = match overlay {
-                    Some((overlay, _)) => overlay.grapheme.as_str().into(),
-                    None => Cow::from(grapheme).into(),
-                };
-
-                (grapheme, GraphemeSource::Document { codepoints })
-            } else {
-                if self.exhausted {
-                    return None;
+    /// Yields the placeholder of the fold whose header line ends at `char_pos`, if any.
+    /// Like inline annotations the placeholder is displayed before the grapheme at `char_pos`.
+    fn next_fold_placeholder_grapheme(
+        &mut self,
+        char_pos: usize,
+    ) -> Option<(&'t str, Option<Highlight>)> {
+        loop {
+            if let Some(&mut (ref mut placeholder, highlight)) = self.fold_placeholder.as_mut() {
+                if let Some(grapheme) = placeholder.next() {
+                    return Some((grapheme, highlight));
                 }
-                self.exhausted = true;
-                // EOF grapheme is required for rendering
-                // and correct position computations
-                return Some(GraphemeWithSource {
-                    grapheme: Grapheme::Other { g: " ".into() },
-                    source: GraphemeSource::Document { codepoints: 0 },
-                });
+                self.fold_placeholder = None;
+            }
+
+            if self.fold_placeholder_pos == char_pos {
+                return None;
+            }
+            let fold = self.annotations.fold_at(char_pos)?;
+            self.fold_placeholder_pos = char_pos;
+            self.fold_placeholder = Some((
+                UnicodeSegmentation::graphemes(&*fold.placeholder, true),
+                self.annotations.fold_highlight(),
+            ));
+        }
+    }
+
+    fn advance_grapheme(&mut self, col: usize, char_pos: usize) -> Option<GraphemeWithSource<'t>> {
+        let (grapheme, source) = if let Some((grapheme, highlight)) =
+            self.next_inline_annotation_grapheme(char_pos)
+        {
+            (grapheme.into(), GraphemeSource::VirtualText { highlight })
+        } else if let Some((grapheme, highlight)) = self.next_fold_placeholder_grapheme(char_pos) {
+            (grapheme.into(), GraphemeSource::VirtualText { highlight })
+        } else if let Some(grapheme) = self.graphemes.next() {
+            let mut codepoints = grapheme.len_chars() as u32;
+
+            let overlay = self.annotations.overlay_at(char_pos);
+
+            // The line ending of a folded header line swallows everything that is hidden by
+            // the fold: it is yielded as a single grapheme that spans all the hidden text.
+            if LineEnding::from_rope_slice(&grapheme).is_some() {
+                if let Some(fold) = self.annotations.fold_at(char_pos) {
+                    if fold.end <= self.text.len_chars() {
+                        codepoints = (fold.end - char_pos) as u32;
+                        self.graphemes = self.text.slice(fold.end..).graphemes();
+                        self.annotations.skip_layers_to(fold.end);
+                    }
+                }
+            }
+
+            let grapheme = match overlay {
+                Some((overlay, _)) => overlay.grapheme.as_str().into(),
+                None => Cow::from(grapheme).into(),
             };
+
+            (grapheme, GraphemeSource::Document { codepoints })
+        } else {
+            if self.exhausted {
+                return None;
+            }
+            self.exhausted = true;
+            // EOF grapheme is required for rendering
+            // and correct position computations
+            return Some(GraphemeWithSource {
+                grapheme: Grapheme::Other { g: " ".into() },
+                source: GraphemeSource::Document { codepoints: 0 },
+            });
+        };
 
         let grapheme = GraphemeWithSource::new(grapheme, col, self.text_fmt.tab_width, source);
 
@@ -455,7 +509,13 @@ impl<'t> Iterator for DocumentFormatter<'t> {
             self.visual_pos.row += 1 + virtual_lines;
             self.visual_pos.col = 0;
             if !grapheme.is_virtual() {
-                self.line_pos += 1;
+                self.line_pos = if self.annotations.has_folds() {
+                    // a folded line ending spans multiple lines
+                    self.text
+                        .char_to_line(self.char_pos.min(self.text.len_chars()))
+                } else {
+                    self.line_pos + 1
+                };
             }
         } else {
             self.visual_pos.col += grapheme.width();
