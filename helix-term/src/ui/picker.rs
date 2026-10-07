@@ -1203,16 +1203,23 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         );
 
         // The mode indicator only exists for a modal picker; a non-modal one
-        // renders its prompt line exactly as it always has.
-        let mode = cx
-            .editor
-            .config()
-            .picker
-            .modal
-            .then(|| match self.mode(cx.editor) {
-                PickerMode::Insert => ("INS ", cx.editor.theme.get("ui.statusline.insert")),
-                PickerMode::Normal => ("NOR ", cx.editor.theme.get("ui.statusline.normal")),
-            });
+        // renders its prompt line exactly as it always has. It is styled like
+        // the statusline's own mode indicator: in the mode's colour only when
+        // `editor.color-modes` is set, in the plain statusline style otherwise.
+        let config = cx.editor.config();
+        let mode = config.picker.modal.then(|| {
+            let (label, scope) = match self.mode(cx.editor) {
+                PickerMode::Insert => ("INS ", "ui.statusline.insert"),
+                PickerMode::Normal => ("NOR ", "ui.statusline.normal"),
+            };
+            let scope = if config.color_modes {
+                scope
+            } else {
+                "ui.statusline"
+            };
+            (label, cx.editor.theme.get(scope))
+        });
+        drop(config);
         let mode_width = mode.map_or(0, |(label, _)| label.len() as u16);
 
         let area = inner.clip_left(1).with_height(1);
