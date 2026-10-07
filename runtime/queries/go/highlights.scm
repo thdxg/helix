@@ -1,6 +1,9 @@
 
 ; Identifiers
 
+(import_spec
+  path: (interpreted_string_literal "\"" @namespace))
+
 (field_identifier) @variable.other.member
 
 (identifier) @variable
