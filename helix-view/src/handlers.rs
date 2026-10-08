@@ -75,13 +75,10 @@ pub fn register_hooks(handlers: &Handlers) {
         // (which re-reads ignore files) when its own settings actually changed.
         if event.old.file_watcher != event.new.file_watcher {
             event.editor.file_watcher.reload(&event.new.file_watcher);
-            // Update extra watched paths from VCS providers (e.g., external HEAD files for worktrees)
+            // Re-track the VCS state that moves HEAD: the watcher may have turned on or off
             let (workspace, _) = helix_loader::find_workspace();
-            let extra_paths = event.editor.diff_providers.get_watched_paths(&workspace);
-            event
-                .editor
-                .file_watcher
-                .set_extra_watched_paths(extra_paths);
+            let vcs_paths = event.editor.diff_providers.get_watched_paths(&workspace);
+            event.editor.file_watcher.set_vcs_paths(vcs_paths);
         }
         Ok(())
     });

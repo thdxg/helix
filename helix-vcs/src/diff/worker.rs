@@ -159,13 +159,20 @@ impl EventAccumulator {
             }
         }
 
+        // Register for the end of the diff *before* it starts: `notify_waiters` only
+        // wakes waiters that are already registered, and a small diff finishes before
+        // a freshly spawned task gets to poll `notified()`. That lost the redraw after
+        // a diff base update, leaving the gutter stale until the next keypress.
+        let mut diff_finished = Box::pin(diff_finished_notify.notified_owned());
+        diff_finished.as_mut().enable();
+
         // setup task to trigger the rendering
         match self.render_lock.take() {
             // diff is performed outside of the rendering loop
             // request a redraw after the diff is done
             None => {
                 tokio::spawn(async move {
-                    diff_finished_notify.notified().await;
+                    diff_finished.await;
                     helix_event::request_redraw();
                 });
             }
@@ -180,7 +187,7 @@ impl EventAccumulator {
                         // Acquire a lock on the redraw handle.
                         // The lock will block the rendering from occurring while held.
                         // The rendering waits for the diff if it doesn't time out
-                        timeout_at(timeout, diff_finished_notify.notified()).await
+                        timeout_at(timeout, &mut diff_finished).await
                     };
                     // we either reached the timeout or the diff is finished, release the render lock
                     drop(lock);
@@ -191,7 +198,7 @@ impl EventAccumulator {
                     // Diff failed to complete in time log the event
                     // and wait until the diff occurs to trigger an async redraw
                     log::info!("Diff computation timed out, update of diffs might appear delayed");
-                    diff_finished_notify.notified().await;
+                    diff_finished.await;
                     helix_event::request_redraw()
                 });
             }
@@ -202,7 +209,7 @@ impl EventAccumulator {
                 timeout: None,
             }) => {
                 tokio::spawn(async move {
-                    diff_finished_notify.notified().await;
+                    diff_finished.await;
                     // diff is done release the lock
                     drop(lock)
                 });

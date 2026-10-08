@@ -1,4 +1,5 @@
 use std::borrow::Borrow;
+use std::ffi::OsStr;
 use std::mem::replace;
 use std::path::{Path, PathBuf};
 use std::slice;
@@ -94,9 +95,12 @@ pub struct Watcher {
     filter: Arc<WatchFilter>,
     roots: Vec<(PathBuf, usize)>,
     config: Config,
-    /// Extra paths that need polling (e.g., VCS HEAD files outside workspace)
-    /// Stored with their last known mtime for change detection
+    /// VCS state files the watcher does not cover (it is off, or they live in a git
+    /// directory it cannot watch), polled instead. Stored with their last known mtime
+    /// for change detection.
     extra_watched_paths: Vec<(PathBuf, Option<SystemTime>)>,
+    /// `.git` directories outside the workspace added as roots by [`Self::set_vcs_paths`].
+    vcs_roots: Vec<PathBuf>,
 }
 
 impl Watcher {
@@ -113,6 +117,7 @@ impl Watcher {
             roots: Vec::new(),
             config: config.clone(),
             extra_watched_paths: Vec::new(),
+            vcs_roots: Vec::new(),
         };
         watcher.reload(config);
         watcher
@@ -192,14 +197,33 @@ impl Watcher {
             Ok(p) => p,
             Err(_) => return false,
         };
+        self.is_watching_canonical(&path)
+    }
+
+    /// Like [`Self::is_watching`], but for a file that need not exist yet (a branch
+    /// that has no loose ref until its next commit): only its directory is resolved.
+    fn would_watch(&self, path: &Path) -> bool {
+        if self.watcher.is_none() {
+            return false;
+        }
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+            return false;
+        };
+        match dir.canonicalize() {
+            Ok(dir) => self.is_watching_canonical(&dir.join(name)),
+            Err(_) => false,
+        }
+    }
+
+    fn is_watching_canonical(&self, path: &Path) -> bool {
         let (workspace, _) = helix_loader::find_workspace();
         // Check if under workspace and not filtered
-        if path.starts_with(&workspace) && !self.filter.ignore_path_rec(&path, Some(false)) {
+        if path.starts_with(&workspace) && !self.filter.ignore_path_rec(path, Some(false)) {
             return true;
         }
         // Check if under any explicitly added root and not filtered
         for (root, _) in &self.roots {
-            if path.starts_with(root) && !self.filter.ignore_path_rec(&path, Some(false)) {
+            if path.starts_with(root) && !self.filter.ignore_path_rec(path, Some(false)) {
                 return true;
             }
         }
@@ -225,22 +249,56 @@ impl Watcher {
         !self.extra_watched_paths.is_empty()
     }
 
-    /// Set extra paths to watch via polling.
-    /// These are paths outside the main watched workspace that need change detection.
-    /// Only paths outside the workspace are added (paths inside are already watched).
-    pub fn set_extra_watched_paths(&mut self, paths: Vec<PathBuf>) {
+    /// Track the VCS state files that decide what `HEAD` points at (see
+    /// [`is_git_head_state`]), so their changes are reported as [`FileSystemDidChange`].
+    ///
+    /// Inside the workspace the watcher already sees them. A git directory outside it
+    /// -- a linked worktree's, whose `.git` is a file pointing into the main checkout --
+    /// is added as a watch root, the filter keeping everything but those files out.
+    /// Whatever the watcher still cannot cover (it is off, or the git directory is not
+    /// named `.git`, as with submodules) is polled. Call again whenever `HEAD` moves to
+    /// another branch: the branch ref is one of the files.
+    pub fn set_vcs_paths(&mut self, paths: Vec<PathBuf>) {
         let (workspace, _) = helix_loader::find_workspace();
+        for path in &paths {
+            let Some(git_dir) = path.ancestors().find(|it| it.ends_with(".git")) else {
+                continue;
+            };
+            let Ok(git_dir) = git_dir.canonicalize() else {
+                continue;
+            };
+            if git_dir.starts_with(&workspace) || self.vcs_roots.contains(&git_dir) {
+                continue;
+            }
+            self.add_root(&git_dir);
+            self.vcs_roots.push(git_dir);
+        }
+        let polled: Vec<PathBuf> = paths
+            .into_iter()
+            .filter(|path| !self.would_watch(path))
+            .collect();
+        self.set_extra_watched_paths(polled);
+    }
+
+    /// Set extra paths to watch via polling.
+    fn set_extra_watched_paths(&mut self, paths: Vec<PathBuf>) {
+        let old = std::mem::take(&mut self.extra_watched_paths);
         self.extra_watched_paths = paths
             .into_iter()
-            .filter(|path| !path.starts_with(&workspace))
             .map(|path| {
+                // Keep the last seen mtime of a path that was already polled: the
+                // list is refreshed right after a change, and resetting it would
+                // hide any change that landed in between.
+                if let Some((_, mtime)) = old.iter().find(|(it, _)| *it == path) {
+                    return (path, *mtime);
+                }
                 let mtime = path.metadata().ok().and_then(|m| m.modified().ok());
                 (path, mtime)
             })
             .collect();
         if !self.extra_watched_paths.is_empty() {
-            log::info!(
-                "added {} extra paths for polling: {:?}",
+            log::debug!(
+                "polling {} VCS paths: {:?}",
                 self.extra_watched_paths.len(),
                 self.extra_watched_paths
                     .iter()
@@ -517,7 +575,7 @@ impl WatchFilter {
         if let Some(ignore) = IgnoreFiles::is_ignored(ignore_files, path, is_dir) {
             return ignore;
         }
-        // ignore .git dircectory except .git/HEAD (and .git itself)
+        // ignore the .git directory except the state that moves HEAD
         if is_vcs_ignore(path, self.watch_vcs) {
             return true;
         }
@@ -587,13 +645,40 @@ fn file_name(path: &Path) -> Option<&str> {
     path.file_name().and_then(|it| it.to_str())
 }
 
+/// The components of `path` below its innermost `.git` directory, or `None` when
+/// `path` is not inside (or is not itself) a `.git` directory.
+fn git_dir_relative(path: &Path) -> Option<Vec<&OsStr>> {
+    let components: Vec<&OsStr> = path.iter().collect();
+    let git_dir = components.iter().rposition(|it| *it == ".git")?;
+    Some(components[git_dir + 1..].to_vec())
+}
+
+/// Whether `path` lies on the way to the git state that decides which commit `HEAD`
+/// resolves to: `HEAD`, a loose branch ref under `refs/heads`, `packed-refs`, or a
+/// linked worktree's `.git/worktrees/<name>/HEAD` -- or is one of the directories
+/// leading to them, including `.git` itself. Everything else in `.git` (objects, the
+/// index, logs) churns constantly and never moves `HEAD`.
+pub fn is_git_head_state(path: &Path) -> bool {
+    let Some(rest) = git_dir_relative(path) else {
+        return false;
+    };
+    let rest: Vec<&str> = match rest.iter().map(|it| it.to_str()).collect() {
+        Some(rest) => rest,
+        None => return false,
+    };
+    matches!(
+        rest.as_slice(),
+        [] | ["HEAD" | "packed-refs" | "refs" | "worktrees"]
+            | ["refs", "heads", ..]
+            | ["worktrees", _]
+            | ["worktrees", _, "HEAD"]
+    )
+}
+
 fn is_vcs_ignore(path: &Path, watch_vcs: bool) -> bool {
-    // ignore .git directory contents except .git/HEAD (and .git itself)
-    // Note: only checks immediate parent; recursive checking is done by ignore_path_rec
-    if watch_vcs
-        && path.parent().is_some_and(|it| it.ends_with(".git"))
-        && !path.ends_with(".git/HEAD")
-    {
+    // ignore .git directory contents except the files that move HEAD (see
+    // `is_git_head_state`), the directories leading to them and .git itself
+    if watch_vcs && git_dir_relative(path).is_some() && !is_git_head_state(path) {
         return true;
     }
     match file_name(path) {
@@ -610,7 +695,8 @@ mod tests {
     use ignore::gitignore::Gitignore;
 
     use crate::file_watcher::{
-        is_hardcoded_whitelist, is_hidden, is_vcs_ignore, IgnoreFiles, WatchFilter,
+        is_git_head_state, is_hardcoded_whitelist, is_hidden, is_vcs_ignore, IgnoreFiles,
+        WatchFilter,
     };
 
     fn filter(roots: &[&str]) -> WatchFilter {
@@ -678,13 +764,49 @@ mod tests {
         assert!(!is_vcs_ignore(Path::new(".git"), true));
         assert!(!is_vcs_ignore(Path::new(".git/HEAD"), true));
         assert!(is_vcs_ignore(Path::new(".git/foo"), true));
-        // Note: .git/foo/bar is NOT caught by is_vcs_ignore (only checks immediate parent)
-        // but it IS caught by ignore_path_rec which checks ancestors recursively
-        assert!(!is_vcs_ignore(Path::new(".git/foo/bar"), true));
+        assert!(is_vcs_ignore(Path::new(".git/foo/bar"), true));
         assert!(!is_vcs_ignore(Path::new(".foo"), true));
+        // with VCS watching off, .git itself is ignored, so nothing below it is reached
+        assert!(is_vcs_ignore(Path::new(".git"), false));
         assert!(is_vcs_ignore(Path::new(".jj"), true));
         assert!(is_vcs_ignore(Path::new(".svn"), true));
         assert!(is_vcs_ignore(Path::new(".hg"), true));
+    }
+
+    /// A commit moves the branch ref, not `HEAD`, so the refs that `HEAD` resolves
+    /// through must be watched -- and the directories leading to them, or the watcher
+    /// never descends that far. The rest of `.git` stays ignored.
+    #[test]
+    fn git_head_state_is_watched() {
+        for path in [
+            "/repo/.git",
+            "/repo/.git/HEAD",
+            "/repo/.git/packed-refs",
+            "/repo/.git/refs",
+            "/repo/.git/refs/heads",
+            "/repo/.git/refs/heads/main",
+            "/repo/.git/refs/heads/feature/nested",
+            "/repo/.git/worktrees",
+            "/repo/.git/worktrees/wt",
+            "/repo/.git/worktrees/wt/HEAD",
+        ] {
+            assert!(!is_vcs_ignore(Path::new(path), true), "{path}");
+        }
+        for path in [
+            "/repo/.git/index",
+            "/repo/.git/objects",
+            "/repo/.git/objects/ab/cdef",
+            "/repo/.git/logs/HEAD",
+            "/repo/.git/refs/tags",
+            "/repo/.git/refs/remotes/origin/main",
+            "/repo/.git/worktrees/wt/index",
+            "/repo/.git/worktrees/wt/logs/HEAD",
+        ] {
+            assert!(is_vcs_ignore(Path::new(path), true), "{path}");
+        }
+        // only paths inside a .git directory are VCS state
+        assert!(!is_git_head_state(Path::new("/repo/HEAD")));
+        assert!(!is_git_head_state(Path::new("/repo/refs/heads/main")));
     }
 
     #[test]

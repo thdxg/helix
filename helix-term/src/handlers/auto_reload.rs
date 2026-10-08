@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{self, AtomicBool};
+use std::sync::atomic::{self, AtomicBool, AtomicUsize};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -38,11 +38,12 @@ impl ReloadHandler {
             return;
         }
         let fs_events = event.fs_events.clone();
-        // React to content changes (Modified) and to deletions (Delete) of open files.
-        // Create/Tempfile carry no action for already-open buffers.
-        if !fs_events
+        // Tempfiles (created and removed within the settle period) never matter. Any
+        // other event may move a VCS ref -- a new branch's first commit creates its
+        // loose ref -- which `needs_reload` decides on the main thread below.
+        if fs_events
             .iter()
-            .any(|event| matches!(event.ty, EventType::Modified | EventType::Delete))
+            .all(|event| event.ty == EventType::Tempfile)
         {
             return;
         }
@@ -51,11 +52,13 @@ impl ReloadHandler {
             let mut vcs_reload = false;
 
             for fs_event in &*fs_events {
+                vcs_reload |= editor.diff_providers.needs_reload(fs_event);
+
+                // React to content changes (Modified) and to deletions (Delete) of
+                // open files. Create carries no action for already-open buffers.
                 if !matches!(fs_event.ty, EventType::Modified | EventType::Delete) {
                     continue;
                 }
-                vcs_reload |= editor.diff_providers.needs_reload(fs_event);
-
                 let Some(doc_id) = editor.document_id_by_path(fs_event.path.as_std_path()) else {
                     continue;
                 };
@@ -149,15 +152,17 @@ fn changed_unwatched_paths(editor: &Editor) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Re-check unwatched open files when the terminal regains focus -- they are only
-/// polled otherwise, and regaining focus is when a user is most likely to have
-/// just edited them elsewhere. Routes through the same `FileSystemDidChange` path
-/// as the watcher and poll (so prompt de-duplication still applies).
-pub(crate) fn on_focus_gained(editor: &Editor) {
+/// Re-check unwatched open files and VCS state when the terminal regains focus --
+/// they are only polled otherwise, and regaining focus is when a user is most likely
+/// to have just edited or committed them elsewhere. Routes through the same
+/// `FileSystemDidChange` path as the watcher and poll (so prompt de-duplication
+/// still applies).
+pub(crate) fn on_focus_gained(editor: &mut Editor) {
     if !editor.config().auto_reload.enable {
         return;
     }
-    let changed = changed_unwatched_paths(editor);
+    let mut changed = changed_unwatched_paths(editor);
+    changed.extend(editor.file_watcher.poll_extra_paths());
     if !changed.is_empty() {
         dispatch(FileSystemDidChange {
             fs_events: events_from_paths(changed),
@@ -281,16 +286,21 @@ fn handle_document_deleted(editor: &mut Editor, doc_id: DocumentId) {
     ));
 }
 
-/// Reload VCS diffs for all documents
+/// Bumped by every [`reload_vcs_diffs`], so that of several overlapping reloads (a
+/// rebase moves `HEAD` once per commit) only the newest is applied.
+static VCS_RELOAD_GENERATION: AtomicUsize = AtomicUsize::new(0);
+
+/// Re-read the diff base and head name of every document after `HEAD` moved.
+///
+/// Reading them opens the repository and walks the commit tree once per document,
+/// so this runs off the main thread and applies the results in a job.
 fn reload_vcs_diffs(editor: &mut Editor) {
-    // Resolve each document's new diff base first (this borrows `workspace_trust` and
-    // `diff_providers`), then apply the results to the documents in a second pass to
-    // avoid overlapping mutable/immutable borrows of the editor.
-    let updates: Vec<(helix_view::DocumentId, Option<Vec<u8>>)> = editor
+    let generation = VCS_RELOAD_GENERATION.fetch_add(1, atomic::Ordering::Relaxed) + 1;
+    let docs: Vec<(DocumentId, PathBuf, bool)> = editor
         .documents
         .values()
         .filter_map(|doc| {
-            let path = doc.path()?;
+            let path = doc.path()?.to_path_buf();
             let trust_full = editor
                 .workspace_trust
                 .query(
@@ -298,20 +308,42 @@ fn reload_vcs_diffs(editor: &mut Editor) {
                     helix_loader::workspace_trust::TrustQuery::Git,
                 )
                 .is_trusted();
-            Some((
-                doc.id(),
-                editor.diff_providers.get_diff_base(path, trust_full),
-            ))
+            Some((doc.id(), path, trust_full))
         })
         .collect();
+    let diff_providers = editor.diff_providers.clone();
+    let (workspace, _) = helix_loader::find_workspace();
 
-    for (doc_id, diff_base) in updates {
-        let doc = doc_mut!(editor, &doc_id);
-        match diff_base {
-            Some(diff_base) => doc.set_diff_base(diff_base),
-            None => doc.diff_handle = None,
-        }
-    }
+    tokio::task::spawn_blocking(move || {
+        let updates: Vec<_> = docs
+            .into_iter()
+            .map(|(doc_id, path, trust_full)| {
+                let diff_base = diff_providers.get_diff_base(&path, trust_full);
+                let head = diff_providers.get_current_head_name(&path, trust_full);
+                (doc_id, diff_base, head)
+            })
+            .collect();
+        // a checkout may have switched branches, and with them the ref to watch
+        let vcs_paths = diff_providers.get_watched_paths(&workspace);
+
+        job::dispatch_blocking(move |editor, _| {
+            if VCS_RELOAD_GENERATION.load(atomic::Ordering::Relaxed) != generation {
+                return;
+            }
+            for (doc_id, diff_base, head) in updates {
+                // the document may have been closed meanwhile
+                let Some(doc) = editor.documents.get_mut(&doc_id) else {
+                    continue;
+                };
+                match diff_base {
+                    Some(diff_base) => doc.set_diff_base(diff_base),
+                    None => doc.diff_handle = None,
+                }
+                doc.set_version_control_head(head);
+            }
+            editor.file_watcher.set_vcs_paths(vcs_paths);
+        });
+    });
 }
 
 /// Shows a prompt asking the user whether to reload a modified document.
