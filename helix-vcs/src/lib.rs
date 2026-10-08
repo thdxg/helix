@@ -67,13 +67,13 @@ impl DiffProviderRegistry {
             .any(|provider| provider.needs_reload(fs_event))
     }
 
-    /// Get paths that need to be watched for VCS state changes.
-    /// These are paths like HEAD files that indicate branch/commit changes.
-    /// The workspace path is used to determine if the VCS metadata is external.
+    /// Get the paths that need to be watched for VCS state changes: the files that
+    /// decide which commit the diff base is read from, for the repository containing
+    /// `workspace`.
     pub fn get_watched_paths(&self, workspace: &Path) -> Vec<PathBuf> {
         self.providers
             .iter()
-            .filter_map(|provider| provider.get_watched_path(workspace))
+            .flat_map(|provider| provider.get_watched_paths(workspace))
             .collect()
     }
 
@@ -130,22 +130,12 @@ impl DiffProvider {
             #[cfg(feature = "git")]
             DiffProvider::Git => {
                 let path = fs_event.path.as_std_path();
-                // Check for regular .git/HEAD
-                if path.ends_with(".git/HEAD") {
-                    return true;
-                }
-                // Check for worktree HEAD at .git/worktrees/<name>/HEAD
-                if path.file_name().is_some_and(|f| f == "HEAD") {
-                    // Walk up the path to check for .git/worktrees pattern
-                    if let Some(parent) = path.parent() {
-                        if let Some(grandparent) = parent.parent() {
-                            if grandparent.ends_with(".git/worktrees") {
-                                return true;
-                            }
-                        }
-                    }
-                }
-                false
+                // git writes `<file>.lock` and renames it over `<file>`; the rename
+                // is reported for `<file>` itself.
+                fs_event.ty != helix_core::file_watcher::EventType::Tempfile
+                    && path.extension().is_none_or(|ext| ext != "lock")
+                    && helix_core::file_watcher::is_git_head_state(path)
+                    && !path.ends_with(".git")
             }
             DiffProvider::None => false,
         }
@@ -184,12 +174,12 @@ impl DiffProvider {
         }
     }
 
-    /// Get the path to watch for VCS state changes (e.g., HEAD file).
-    fn get_watched_path(&self, workspace: &Path) -> Option<PathBuf> {
+    /// Get the paths to watch for VCS state changes (e.g., HEAD file).
+    fn get_watched_paths(&self, workspace: &Path) -> Vec<PathBuf> {
         match self {
             #[cfg(feature = "git")]
-            Self::Git => git::get_head_path(workspace),
-            Self::None => None,
+            Self::Git => git::get_head_state_paths(workspace),
+            Self::None => Vec::new(),
         }
     }
 }
@@ -219,6 +209,46 @@ mod tests {
             ty: EventType::Modified,
         };
         assert!(!provider.needs_reload(&event));
+    }
+
+    /// A commit, reset or pull moves the branch ref and leaves `HEAD` untouched.
+    #[cfg(feature = "git")]
+    #[test]
+    fn test_needs_reload_branch_refs() {
+        use helix_core::file_watcher::{CanonicalPathBuf, Event, EventType};
+        use std::path::Path;
+
+        let provider = DiffProvider::Git;
+        let event = |path: &str, ty| Event {
+            path: CanonicalPathBuf::assert_canonicalized(Path::new(path)),
+            ty,
+        };
+
+        for path in [
+            "/repo/.git/refs/heads/main",
+            "/repo/.git/refs/heads/feature/nested",
+            "/repo/.git/packed-refs",
+        ] {
+            for ty in [EventType::Modified, EventType::Create, EventType::Delete] {
+                assert!(provider.needs_reload(&event(path, ty)), "{path} {ty:?}");
+            }
+            assert!(!provider.needs_reload(&event(path, EventType::Tempfile)));
+        }
+        for path in [
+            // the lock file git renames over the ref
+            "/repo/.git/refs/heads/main.lock",
+            "/repo/.git/HEAD.lock",
+            "/repo/.git/refs/tags/v1",
+            "/repo/.git/refs/remotes/origin/main",
+            "/repo/.git/logs/refs/heads/main",
+            "/repo/.git/index",
+            "/repo/.git",
+        ] {
+            assert!(
+                !provider.needs_reload(&event(path, EventType::Modified)),
+                "{path}"
+            );
+        }
     }
 
     #[cfg(feature = "git")]

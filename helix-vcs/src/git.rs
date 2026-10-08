@@ -93,17 +93,31 @@ pub fn for_each_changed_file(
     status(&open_repo(cwd, trust_full)?.to_thread_local(), f)
 }
 
-/// Get the path to the HEAD file for the git repository containing the given path.
-/// This properly handles both regular repositories and worktrees.
-pub fn get_head_path(path: &Path) -> Option<PathBuf> {
+/// The files that decide which commit `HEAD` resolves to in the git repository
+/// containing `path`: `HEAD` itself (a checkout rewrites it), the loose ref of the
+/// checked-out branch (a commit, reset or pull moves it) and `packed-refs` (where that
+/// ref lives once packed). The branch ref need not exist yet. Branch refs live in the
+/// common directory, which a linked worktree shares with the main checkout.
+pub fn get_head_state_paths(path: &Path) -> Vec<PathBuf> {
     // Read-only path resolution for the watcher; open with reduced trust.
-    let repo = open_repo(path, false).ok()?.to_thread_local();
-    // git_dir() returns the path to the actual git directory
-    // For regular repos: /path/to/repo/.git
-    // For worktrees: /path/to/main/.git/worktrees/<name>
-    let git_dir = repo.git_dir();
-    let head_path = git_dir.join("HEAD");
-    head_path.exists().then_some(head_path)
+    let Ok(repo) = open_repo(path, false) else {
+        return Vec::new();
+    };
+    let repo = repo.to_thread_local();
+    // A linked worktree records its common directory relative to its own git
+    // directory (`.git/worktrees/<name>/../..`): resolve it so the paths match the
+    // canonical ones the watcher reports.
+    let common_dir = repo
+        .common_dir()
+        .canonicalize()
+        .unwrap_or_else(|_| repo.common_dir().to_path_buf());
+    let mut paths = vec![repo.git_dir().join("HEAD"), common_dir.join("packed-refs")];
+    if let Ok(Some(branch)) = repo.head_name() {
+        if let Ok(branch) = gix::path::try_from_bstr(branch.as_bstr()) {
+            paths.push(common_dir.join(branch));
+        }
+    }
+    paths
 }
 
 fn open_repo(path: &Path, trust_full: bool) -> Result<ThreadSafeRepository> {

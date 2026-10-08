@@ -1597,10 +1597,10 @@ impl Editor {
         let mut file_watcher = Watcher::new(&conf.file_watcher);
         let diff_providers = DiffProviderRegistry::default();
 
-        // Set up extra watched paths from VCS providers (e.g., external HEAD files for worktrees)
+        // Watch the VCS state that moves HEAD (e.g. branch refs, or a worktree's
+        // external git directory) so the diff gutter follows commits and checkouts
         let (workspace, _) = helix_loader::find_workspace();
-        let extra_paths = diff_providers.get_watched_paths(&workspace);
-        file_watcher.set_extra_watched_paths(extra_paths);
+        file_watcher.set_vcs_paths(diff_providers.get_watched_paths(&workspace));
 
         // HAXX: offset the render area height by 1 to account for prompt/commandline
         area.height -= 1;

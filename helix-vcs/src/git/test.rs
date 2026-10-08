@@ -156,3 +156,48 @@ fn symlink_to_git_repo() {
     assert_eq!(git::get_diff_base(&file_link, true).unwrap(), contents);
     assert_eq!(git::get_diff_base(&file, true).unwrap(), contents);
 }
+
+/// The watched files must follow `HEAD` to the checked-out branch, and for a linked
+/// worktree find that branch in the main checkout's git directory, not its own.
+#[test]
+fn head_state_paths() {
+    let temp_git = empty_git_repo();
+    let repo = temp_git.path().canonicalize().unwrap();
+    File::create(repo.join("file.txt"))
+        .unwrap()
+        .write_all(b"foo")
+        .unwrap();
+    create_commit(&repo, true);
+
+    let git_dir = repo.join(".git");
+    assert_eq!(
+        git::get_head_state_paths(&repo),
+        [
+            git_dir.join("HEAD"),
+            git_dir.join("packed-refs"),
+            git_dir.join("refs/heads/main"),
+        ]
+    );
+
+    let worktrees = tempfile::tempdir().unwrap();
+    let worktree = worktrees.path().canonicalize().unwrap().join("wt");
+    exec_git_cmd(
+        &format!("worktree add -b feature {}", worktree.display()),
+        &repo,
+    );
+    assert_eq!(
+        git::get_head_state_paths(&worktree),
+        [
+            git_dir.join("worktrees/wt/HEAD"),
+            git_dir.join("packed-refs"),
+            git_dir.join("refs/heads/feature"),
+        ]
+    );
+
+    // a detached HEAD has no branch ref to follow
+    exec_git_cmd("checkout --detach", &repo);
+    assert_eq!(
+        git::get_head_state_paths(&repo),
+        [git_dir.join("HEAD"), git_dir.join("packed-refs")]
+    );
+}
