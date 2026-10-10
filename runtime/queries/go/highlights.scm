@@ -4,6 +4,13 @@
 (import_spec
   path: (interpreted_string_literal "\"" @namespace))
 
+; gopls sends a documentLink for each import path, which the editor paints as
+; markup.link.url. Match it here so views without a language server (the
+; picker preview) color the path the same way.
+(import_spec
+  path: (interpreted_string_literal
+    (interpreted_string_literal_content) @markup.link.url))
+
 (field_identifier) @variable.other.member
 
 (identifier) @variable
