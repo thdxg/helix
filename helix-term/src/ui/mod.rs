@@ -364,7 +364,15 @@ fn directory_content(root: &Path, editor: &Editor) -> Result<Vec<(PathBuf, bool)
     Ok(content)
 }
 
+/// The only entry of the directory `path` when that entry is a directory itself,
+/// which `flatten_dirs` collapses into one row with `path`.
+///
+/// A symlink is never flattened past: folding it into a longer path would hide
+/// that it is a link, and where it points.
 fn get_child_if_single_dir(path: &Path) -> Option<PathBuf> {
+    if path.is_symlink() {
+        return None;
+    }
     let mut entries = path.read_dir().ok()?;
     let entry = entries.next()?.ok()?;
     let entry_path = entry.path();
@@ -778,5 +786,27 @@ mod tests {
         File::create(file).unwrap();
 
         assert_eq!(get_child_if_single_dir(root.path()), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_get_child_if_single_dir_stops_at_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        create_dir(&target).unwrap();
+        create_dir(target.join("only")).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        // A symlink is not flattened past, even onto a single child directory...
+        assert_eq!(get_child_if_single_dir(&link), None);
+        assert_eq!(get_child_if_single_dir(&target), Some(target.join("only")));
+
+        // ...but it is flattened onto, so that it ends the collapsed row.
+        let parent = root.path().join("parent");
+        create_dir(&parent).unwrap();
+        let inner_link = parent.join("link");
+        std::os::unix::fs::symlink(&target, &inner_link).unwrap();
+        assert_eq!(get_child_if_single_dir(&parent), Some(inner_link));
     }
 }
