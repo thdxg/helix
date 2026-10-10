@@ -21,10 +21,29 @@ use super::{
     Picker, PickerColumn, Prompt, PromptEvent,
 };
 
-/// For each row of the explorer: (path to the item, is the path a directory?).
-type ExplorerItem = (PathBuf, bool);
-/// The data shared by every row: (file explorer root, style for directories).
-type ExplorerData = (PathBuf, Style);
+/// For each row of the explorer: (path to the item, is the path a directory?,
+/// where the item points when it is a symlink).
+type ExplorerItem = (PathBuf, bool, Option<Symlink>);
+/// The data shared by every row: (file explorer root, styles for the rows).
+type ExplorerData = (PathBuf, RowStyles);
+
+/// Where a symlink in the explorer points.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Symlink {
+    /// The target as the link stores it, which may be relative to the link.
+    target: PathBuf,
+    /// Whether the target does not exist.
+    broken: bool,
+}
+
+/// The theme styles a row is drawn with, read once per explorer.
+pub struct RowStyles {
+    directory: Style,
+    /// The ` -> target` after a symlink's name.
+    symlink: Style,
+    /// The target of a symlink whose target does not exist.
+    broken_symlink: Style,
+}
 
 type FileExplorer = Picker<ExplorerItem, ExplorerData>;
 
@@ -889,7 +908,7 @@ pub(super) fn paste_clipboard(cx: &mut Context, op: DirectoryOperation<'_>) {
 fn file_operation_key(operation: fn(&mut Context, FileOperation<'_>)) -> KeyHandler {
     Box::new(
         move |cx, args: PickerAction<'_, ExplorerItem, ExplorerData>| {
-            let Some((path, is_dir)) = args.selection else {
+            let Some((path, is_dir, _symlink)) = args.selection else {
                 return;
             };
             operation(
@@ -916,7 +935,9 @@ fn directory_operation_key(operation: fn(&mut Context, DirectoryOperation<'_>)) 
             operation(
                 cx,
                 DirectoryOperation {
-                    selected: args.selection.map(|(path, _is_dir)| path.as_path()),
+                    selected: args
+                        .selection
+                        .map(|(path, _is_dir, _symlink)| path.as_path()),
                     root: args.data.0.clone(),
                     cursor: args.cursor,
                     picker_mode: args.mode,
@@ -946,11 +967,60 @@ fn cursor_row(cursor: ExplorerCursor, directory_content: &[ExplorerItem]) -> u32
         // neither test can confuse `foo` with a sibling `foobar`.
         ExplorerCursor::Entry(entry) => directory_content
             .iter()
-            .position(|(path, is_dir)| {
+            .position(|(path, is_dir, _symlink)| {
                 entry.starts_with(path) || (*is_dir && path.starts_with(&entry))
             })
             .unwrap_or_default() as u32,
     }
+}
+
+/// Reads the rows of an explorer rooted at `root`.
+fn explorer_rows(root: &Path, editor: &Editor) -> Result<Vec<ExplorerItem>, std::io::Error> {
+    Ok(with_symlinks(directory_content(root, editor)?))
+}
+
+/// Notes which of the `(path, is_dir)` entries are symlinks, and where they point.
+fn with_symlinks(entries: Vec<(PathBuf, bool)>) -> Vec<ExplorerItem> {
+    entries
+        .into_iter()
+        .map(|(path, is_dir)| {
+            // `read_link` fails on anything that is not a symlink. `exists`
+            // follows the link, so it is false exactly when the target is gone.
+            let symlink = fs::read_link(&path).ok().map(|target| Symlink {
+                target,
+                broken: !path.exists(),
+            });
+            (path, is_dir, symlink)
+        })
+        .collect()
+}
+
+/// The text of an explorer row: the entry's name relative to the root, with a
+/// trailing `/` for a directory and, for a symlink, ` -> target` the way
+/// `ls -l` prints it.
+///
+/// The target is part of the filtered text too, so a query can find a link by
+/// where it points.
+fn row_label<'a>(
+    (path, is_dir, symlink): &'a ExplorerItem,
+    (root, styles): &'a ExplorerData,
+) -> tui::widgets::Cell<'a> {
+    let name = path.strip_prefix(root).unwrap_or(path).to_string_lossy();
+    let mut spans = vec![if *is_dir {
+        Span::styled(format!("{}/", name), styles.directory)
+    } else {
+        Span::raw(name)
+    }];
+    if let Some(Symlink { target, broken }) = symlink {
+        let target_style = if *broken {
+            styles.broken_symlink
+        } else {
+            styles.symlink
+        };
+        spans.push(Span::styled(" -> ", styles.symlink));
+        spans.push(Span::styled(target.to_string_lossy(), target_style));
+    }
+    tui::text::Spans::from(spans).into()
 }
 
 /// Builds the file explorer picker rooted at `root`.
@@ -983,22 +1053,16 @@ fn file_explorer_with_mode(
     editor: &Editor,
 ) -> Result<FileExplorer, std::io::Error> {
     let mode = mode.unwrap_or_else(|| editor.config().file_explorer.default_mode.into());
-    let directory_style = editor.theme.get("ui.text.directory");
-    let directory_content = directory_content(&root, editor)?;
+    let styles = RowStyles {
+        directory: editor.theme.get("ui.text.directory"),
+        symlink: editor.theme.get("ui.text.inactive"),
+        broken_symlink: editor.theme.get("error"),
+    };
+    let directory_content = explorer_rows(&root, editor)?;
 
     let cursor = cursor_row(cursor, &directory_content);
 
-    let columns = [PickerColumn::new(
-        "path",
-        |(path, is_dir): &ExplorerItem, (root, directory_style): &ExplorerData| {
-            let name = path.strip_prefix(root).unwrap_or(path).to_string_lossy();
-            if *is_dir {
-                Span::styled(format!("{}/", name), *directory_style).into()
-            } else {
-                name.into()
-            }
-        },
-    )];
+    let columns = [PickerColumn::new("path", row_label)];
 
     // Shared with the picker below, so that descending into a directory can read
     // the mode the user is in at the moment they press Enter — which is not
@@ -1010,8 +1074,8 @@ fn file_explorer_with_mode(
         columns,
         0,
         directory_content,
-        (root, directory_style),
-        move |cx, (path, is_dir): &ExplorerItem, action| {
+        (root, styles),
+        move |cx, (path, is_dir, _symlink): &ExplorerItem, action| {
             if *is_dir {
                 let new_root = helix_stdx::path::normalize(path);
                 let mode = descend_mode.get();
@@ -1048,7 +1112,7 @@ fn file_explorer_with_mode(
     )
     .with_initial_cursor(cursor)
     .with_mode_handle(mode)
-    .with_preview(|_editor, (path, _is_dir)| Some((path.as_path().into(), None)))
+    .with_preview(|_editor, (path, _is_dir, _symlink)| Some((path.as_path().into(), None)))
     .with_key_handlers(hashmap! {
         // Tree navigation, spelled after the `h`/`l` of the modal layout below
         // so that the two agree about which way is up. A non-modal picker has no
@@ -1132,8 +1196,82 @@ mod test {
             ("/home/user/project/README.md", false),
         ]
         .into_iter()
-        .map(|(path, is_dir)| (PathBuf::from(path), is_dir))
+        .map(|(path, is_dir)| (PathBuf::from(path), is_dir, None))
         .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlink_rows() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        fs::create_dir(root.join("dir")).unwrap();
+        fs::write(root.join("file"), "").unwrap();
+        symlink("dir", root.join("dir_link")).unwrap();
+        symlink("file", root.join("file_link")).unwrap();
+        symlink("missing", root.join("broken_link")).unwrap();
+
+        let entries = ["dir", "dir_link", "broken_link", "file", "file_link"]
+            .into_iter()
+            .map(|name| (root.join(name), root.join(name).is_dir()))
+            .collect();
+        let rows: Vec<_> = with_symlinks(entries)
+            .into_iter()
+            .map(|(path, is_dir, symlink)| {
+                let name = path.strip_prefix(root).unwrap().to_owned();
+                (name, is_dir, symlink.map(|link| (link.target, link.broken)))
+            })
+            .collect();
+
+        let link = |target: &str, broken| Some((PathBuf::from(target), broken));
+        assert_eq!(
+            rows,
+            [
+                (PathBuf::from("dir"), true, None),
+                (PathBuf::from("dir_link"), true, link("dir", false)),
+                (PathBuf::from("broken_link"), false, link("missing", true)),
+                (PathBuf::from("file"), false, None),
+                (PathBuf::from("file_link"), false, link("file", false)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_row_label() {
+        let data = (
+            PathBuf::from("/project"),
+            RowStyles {
+                directory: Style::default(),
+                symlink: Style::default(),
+                broken_symlink: Style::default(),
+            },
+        );
+        let label = |path: &str, is_dir, symlink| {
+            let item: ExplorerItem = (PathBuf::from(path), is_dir, symlink);
+            let cell = row_label(&item, &data);
+            cell.content
+                .lines
+                .iter()
+                .flat_map(|line| line.0.iter().map(|span| span.content.as_ref()))
+                .collect::<String>()
+        };
+        let link = |target: &str| Symlink {
+            target: PathBuf::from(target),
+            broken: false,
+        };
+
+        assert_eq!(label("/project/src", true, None), "src/");
+        assert_eq!(label("/project/main.rs", false, None), "main.rs");
+        assert_eq!(
+            label("/project/lib", true, Some(link("../shared/lib"))),
+            "lib/ -> ../shared/lib"
+        );
+        assert_eq!(
+            label("/project/.env", false, Some(link("/etc/app.env"))),
+            ".env -> /etc/app.env"
+        );
     }
 
     #[test]
