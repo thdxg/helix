@@ -264,6 +264,11 @@ pub static GLOBAL_ENGINE: Lazy<Mutex<steel::steel_vm::engine::Engine>> =
 
 static GENERATION: AtomicUsize = AtomicUsize::new(0);
 
+// `document-opened` hooks, kept so they can be replayed for the documents that were
+// already open when the init script registered them.
+static DOCUMENT_OPENED_HOOKS: Lazy<Mutex<Vec<(usize, RootedSteelVal)>>> =
+    Lazy::new(|| Mutex::new(Vec::new()));
+
 fn increment_generation() {
     GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
@@ -1757,6 +1762,21 @@ impl super::PluginSystem for SteelScriptingEngine {
         event_reader: TerminalEventReaderHandle,
     ) {
         run_initialization_script(cx, configuration, language_configuration, event_reader);
+    }
+
+    fn replay_document_opened(&self, docs: &[DocumentId]) {
+        let hooks = DOCUMENT_OPENED_HOOKS.lock().unwrap();
+
+        for &doc_id in docs {
+            for (generation, rooted) in hooks.iter() {
+                let callback = construct_callback(
+                    *generation,
+                    rooted.value().clone(),
+                    [doc_id.into_steelval().unwrap()],
+                );
+                job::dispatch_blocking_jobs(callback);
+            }
+        }
     }
 
     fn handle_keymap_event(
@@ -3675,6 +3695,12 @@ fn register_document_opened(
     generation: usize,
     rooted: RootedSteelVal,
 ) -> steel::UnRecoverableResult {
+    {
+        let mut hooks = DOCUMENT_OPENED_HOOKS.lock().unwrap();
+        hooks.retain(|(generation, _)| is_current_generation(*generation));
+        hooks.push((generation, rooted.value().as_rooted()));
+    }
+
     // TODO: Share this code with the above since most of it is
     // exactly the same
     register_hook!(move |event: &mut DocumentDidOpen<'_>| {
