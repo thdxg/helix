@@ -1,7 +1,7 @@
 use arc_swap::{ArcSwap, ArcSwapAny};
 use helix_core::syntax;
 use helix_lsp::{jsonrpc, LanguageServerId};
-use helix_view::{document::Mode, input::KeyEvent};
+use helix_view::{document::Mode, input::KeyEvent, DocumentId};
 
 #[cfg(unix)]
 use termina::{EventReader, Terminal};
@@ -103,15 +103,12 @@ impl ScriptingEngine {
         }
     }
 
-    pub fn run_initialization_script(
-        cx: &mut Context,
-        configuration: Arc<ArcSwapAny<Arc<Config>>>,
-        language_configuration: Arc<ArcSwap<syntax::Loader>>,
-        event_reader: TerminalEventReaderHandle,
-    ) {
+    /// Pick the plugin systems to dispatch to. This must run before anything else
+    /// on `ScriptingEngine` other than `initialize`.
+    pub fn select_plugin_systems(configuration: &Config) {
         // Set up a flag to disable steel, even on the current build?
         #[allow(clippy::if_same_then_else, reason = "not the same with steel feature")]
-        if configuration.load().editor.enable_steel {
+        if configuration.editor.enable_steel {
             PLUGIN_PRECEDENCE
                 .set(vec![
                     #[cfg(feature = "steel")]
@@ -124,7 +121,14 @@ impl ScriptingEngine {
                 .set(vec![PluginSystemTypes::None(NoEngine)])
                 .ok();
         }
+    }
 
+    pub fn run_initialization_script(
+        cx: &mut Context,
+        configuration: Arc<ArcSwapAny<Arc<Config>>>,
+        language_configuration: Arc<ArcSwap<syntax::Loader>>,
+        event_reader: TerminalEventReaderHandle,
+    ) {
         for kind in plugins() {
             manual_dispatch!(
                 kind,
@@ -135,6 +139,12 @@ impl ScriptingEngine {
                     event_reader.clone()
                 )
             )
+        }
+    }
+
+    pub fn replay_document_opened(docs: &[DocumentId]) {
+        for kind in plugins() {
+            manual_dispatch!(kind, replay_document_opened(docs))
         }
     }
 
@@ -266,8 +276,8 @@ pub trait PluginSystem {
     #[allow(unused)]
     fn engine_name(&self) -> PluginSystemKind;
 
-    /// Post initialization, once the context is available. This means you should be able to
-    /// run anything here that could modify the context before the main editor is available.
+    /// Post initialization, once the context is available. At startup this runs after the
+    /// first frame has been drawn, but before any input is handled.
     fn run_initialization_script(
         &self,
         _cx: &mut Context,
@@ -276,6 +286,10 @@ pub trait PluginSystem {
         _event_reader: TerminalEventReaderHandle,
     ) {
     }
+
+    /// Deliver `document-opened` to the hooks the initialization script registered, for
+    /// documents that were opened before it ran.
+    fn replay_document_opened(&self, _docs: &[DocumentId]) {}
 
     /// Allow the engine to directly handle a keymap event. This is some of the tightest integration
     /// with the engine, directly intercepting any keymap events. By default, this just delegates to the

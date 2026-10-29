@@ -81,6 +81,10 @@ pub struct Application {
     lsp_progress: LspProgressMap,
 
     theme_mode: Option<theme::Mode>,
+
+    /// The init script has not run yet. It runs after the first frame is drawn, since
+    /// loading it takes long enough to noticeably delay startup.
+    init_script_pending: bool,
 }
 
 #[cfg(feature = "integration")]
@@ -145,26 +149,8 @@ impl Application {
 
         compositor.push(editor_view);
 
-        let mut jobs = Jobs::new();
-        {
-            let syn_loader = editor.syn_loader.clone();
-
-            let mut cx = crate::commands::Context {
-                register: None,
-                count: std::num::NonZeroUsize::new(1),
-                editor: &mut editor,
-                callback: Vec::new(),
-                on_next_key_callback: None,
-                jobs: &mut jobs,
-            };
-
-            crate::commands::ScriptingEngine::run_initialization_script(
-                &mut cx,
-                config.clone(),
-                syn_loader,
-                crate::commands::engine::TerminalEventReaderHandle::new(terminal.backend()),
-            );
-        }
+        let jobs = Jobs::new();
+        crate::commands::ScriptingEngine::select_plugin_systems(&config.load());
 
         if args.load_tutor {
             let path = helix_loader::runtime_file(Path::new("tutor"));
@@ -278,9 +264,48 @@ impl Application {
             jobs,
             lsp_progress: LspProgressMap::new(),
             theme_mode,
+            init_script_pending: true,
         };
 
         Ok(app)
+    }
+
+    fn run_init_script(&mut self) {
+        let syn_loader = self.editor.syn_loader.clone();
+        let startup_status = self.editor.status_msg.clone();
+
+        let mut cx = crate::commands::Context {
+            register: None,
+            count: std::num::NonZeroUsize::new(1),
+            editor: &mut self.editor,
+            callback: Vec::new(),
+            on_next_key_callback: None,
+            jobs: &mut self.jobs,
+        };
+
+        crate::commands::ScriptingEngine::run_initialization_script(
+            &mut cx,
+            self.config.clone(),
+            syn_loader,
+            crate::commands::engine::TerminalEventReaderHandle::new(self.terminal.backend()),
+        );
+
+        // Keep the startup status (e.g. "Loaded 1 file.") over anything the script printed,
+        // as when it ran before the files were opened, unless the script failed.
+        if startup_status.is_some() && !matches!(self.editor.status_msg, Some((_, Severity::Error)))
+        {
+            self.editor.status_msg = startup_status;
+        }
+
+        // The files given on the command line were opened before the script registered its
+        // hooks. Only documents opened from a path dispatch `DocumentDidOpen`.
+        let opened: Vec<_> = self
+            .editor
+            .documents()
+            .filter(|doc| doc.path().is_some())
+            .map(|doc| doc.id())
+            .collect();
+        crate::commands::ScriptingEngine::replay_document_opened(&opened);
     }
 
     async fn render(&mut self) {
@@ -341,6 +366,12 @@ impl Application {
     where
         S: Stream<Item = std::io::Result<TerminalEvent>> + Unpin,
     {
+        if self.init_script_pending {
+            self.init_script_pending = false;
+            self.run_init_script();
+            self.render().await;
+        }
+
         loop {
             if self.editor.should_close() {
                 return false;
