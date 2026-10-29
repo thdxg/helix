@@ -136,6 +136,12 @@ FLAGS:
         }
     };
 
+    // Boot the scripting engine in the background while the rest of startup runs; it
+    // takes tens of milliseconds, and the init script waits on it.
+    if config.editor.enable_steel {
+        helix_term::commands::ScriptingEngine::initialize();
+    }
+
     let workspace_trust =
         helix_loader::workspace_trust::WorkspaceTrust::new((&config.editor.workspace_trust).into());
 
