@@ -180,11 +180,16 @@ fn head_state_paths() {
     );
 
     let worktrees = tempfile::tempdir().unwrap();
-    let worktree = worktrees.path().canonicalize().unwrap().join("wt");
+    // git rejects the `\\?\` prefix of a canonical Windows path, so it gets the path
+    // as the tempdir hands it out; the canonical one is what the watcher compares.
     exec_git_cmd(
-        &format!("worktree add -b feature {}", worktree.display()),
+        &format!(
+            "worktree add -b feature {}",
+            worktrees.path().join("wt").display()
+        ),
         &repo,
     );
+    let worktree = worktrees.path().join("wt").canonicalize().unwrap();
     assert_eq!(
         git::get_head_state_paths(&worktree),
         [
