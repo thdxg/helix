@@ -197,14 +197,21 @@ async fn closing_a_fold_preserves_an_extended_selections_anchor() -> anyhow::Res
     // "a" is the header of the outer fold(0,4); "b" is the header of the inner fold(1,3),
     // which hides "c" and "d"
     let nested = "#[a|]#\n  b\n    c\n    d\n  e\nf\n";
+    // The harness writes the text with the platform's line ending, so a char index into
+    // the `\n` version above moves by the extra chars of every line break before it.
+    let native = |lf_idx: usize| {
+        let plain = "a\n  b\n    c\n    d\n  e\nf\n";
+        let extra = helix_core::NATIVE_LINE_ENDING.len_chars() - 1;
+        lf_idx + plain[..lf_idx].matches('\n').count() * extra
+    };
 
     // extend a selection from "a" down to "c" (anchor 0, head 7: the block cursor lands on the
     // first char of "c"'s line, one past its own grapheme per block-cursor convention)
-    assert_eq!(primary_range(nested, "vjj").await?, (0, 7));
+    assert_eq!(primary_range(nested, "vjj").await?, (0, native(7)));
     // closing the innermost fold around the head ("c") hides it; because the selection is wider
     // than a single grapheme, only the head moves onto the fold's header ("b"), the anchor on
     // "a" is untouched, not collapsed into a single cursor
-    assert_eq!(primary_range(nested, "vjjzc").await?, (0, 2));
+    assert_eq!(primary_range(nested, "vjjzc").await?, (0, native(2)));
 
     Ok(())
 }
