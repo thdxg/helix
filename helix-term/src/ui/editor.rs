@@ -405,15 +405,23 @@ impl EditorView {
         // Paging only moves a counter; the page it landed on is rasterized off
         // the main thread, one page at a time, so holding a paging key neither
         // blocks the editor nor renders pages that go by on the way. The
-        // previous page stays on screen until the new one is ready.
+        // previous page stays on screen until the new one is ready. The same
+        // goes for re-rendering the page sharper when the view is larger than
+        // it was rendered for.
         if graphical {
+            // The area the page is drawn in below, less the statusline.
+            let page_area = editor.tree.get(view_id).area.clip_bottom(1);
+            let fit_px = super::media::fit_px(&editor.graphics, surface.area, page_area);
             let request = editor
                 .documents
                 .get_mut(&doc_id)
                 .expect("media view referenced missing doc")
                 .media
                 .as_mut()
-                .and_then(media::MediaState::take_raster_request);
+                .and_then(|media| {
+                    media.fit_to(fit_px);
+                    media.take_raster_request()
+                });
             if let Some(request) = request {
                 Self::spawn_raster(doc_id, request);
             }

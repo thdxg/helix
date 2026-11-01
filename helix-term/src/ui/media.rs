@@ -19,6 +19,17 @@ pub struct Placement {
     pub max_pan: u16,
 }
 
+/// The size in pixels of `area`, for rasterizing a page to fill it (see
+/// `MediaState::fit_to`). `None` when the terminal does not report its pixel
+/// size. `total` is the whole terminal, which cell metrics are taken from.
+pub fn fit_px(graphics: &GraphicsState, total: Rect, area: Rect) -> Option<(u32, u32)> {
+    let (cell_w, cell_h) = graphics.cell_px(total.width, total.height)?;
+    Some((
+        (area.width as f32 * cell_w) as u32,
+        (area.height as f32 * cell_h) as u32,
+    ))
+}
+
 /// Draw `raster` centred in `area` as kitty unicode-placeholder cells and
 /// return the cells it covers. Returns `None` — having drawn nothing — when
 /// the terminal has no graphics support, so callers can fall back to text.

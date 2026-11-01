@@ -10,11 +10,14 @@
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use anyhow::{anyhow, bail, Context, Result};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 /// The character used for unicode placeholder cells.
@@ -117,6 +120,34 @@ pub fn detect_graphics_mode(config: ImageRenderingConfig) -> GraphicsMode {
 /// otherwise hand the terminal a new image per page, so we free the ones we
 /// have paged away from and let them be retransmitted from the PNG cache.
 const MAX_LOADED_IMAGES: usize = 4;
+
+/// Resolutions a PDF page is rasterized at. A page is rendered at the lowest
+/// one that fills the cells it is drawn in, rather than always at the highest:
+/// `pdftoppm`'s time grows with the pixel count, and a page of scanned slides
+/// takes over ten seconds at 288 DPI where it fits a preview pane at a tenth
+/// of that. Fixed steps rather than an exact fit keep resizing a split from
+/// re-rendering on every cell, and let rasters be found in the cache again.
+const PDF_DPI_STEPS: [u32; 5] = [72, 96, 144, 192, 288];
+const MIN_PDF_DPI: u32 = PDF_DPI_STEPS[0];
+const MAX_PDF_DPI: u32 = PDF_DPI_STEPS[PDF_DPI_STEPS.len() - 1];
+
+/// The resolution at which a page of `page_pt` (width, height in points)
+/// fills a box of `fit_px` pixels, rounded up to a step of [`PDF_DPI_STEPS`].
+/// Without a box -- the terminal does not report its pixel size -- there is
+/// nothing to fit, so the page is rendered as sharp as it gets.
+fn dpi_to_fit(page_pt: (f32, f32), fit_px: Option<(u32, u32)>) -> u32 {
+    let Some((width, height)) = fit_px else {
+        return MAX_PDF_DPI;
+    };
+    if page_pt.0 <= 0.0 || page_pt.1 <= 0.0 {
+        return MAX_PDF_DPI;
+    }
+    let dpi = 72.0 * f32::min(width as f32 / page_pt.0, height as f32 / page_pt.1);
+    PDF_DPI_STEPS
+        .into_iter()
+        .find(|&step| step as f32 >= dpi)
+        .unwrap_or(MAX_PDF_DPI)
+}
 
 #[derive(Debug, Clone, Copy)]
 struct Placement {
@@ -340,6 +371,14 @@ pub struct MediaState {
     rastered: usize,
     /// Page a background rasterize is currently running for, if any.
     pending: Option<usize>,
+    /// Resolution PDF pages should be rasterized at to fill the cells they
+    /// are drawn in; see [`MediaState::fit_to`].
+    dpi: u32,
+    /// Resolution [`MediaState::raster`] was rasterized at.
+    rastered_dpi: u32,
+    /// Ceiling on [`MediaState::dpi`], lowered when a sharper render of the
+    /// page on screen fails so that it is not retried every frame.
+    max_dpi: u32,
     pub raster: Raster,
 }
 
@@ -350,6 +389,7 @@ pub struct RasterRequest {
     source: PathBuf,
     mtime: SystemTime,
     page: usize,
+    dpi: u32,
 }
 
 impl RasterRequest {
@@ -359,19 +399,30 @@ impl RasterRequest {
 
     /// Rasterize the page. Blocking: run this on a blocking task.
     pub fn run(&self) -> Result<Raster> {
-        raster_pdf_page(&self.source, self.mtime, self.page)
+        raster_pdf_page(&self.source, self.mtime, self.page, self.dpi)
     }
 }
 
 impl MediaState {
-    pub fn open(kind: MediaKind, path: &Path) -> Result<Self> {
+    /// Open and rasterize `path`. A PDF's first page is rendered to fill
+    /// `fit_px`, the box in pixels it will be drawn in; without one it starts
+    /// out at the lowest resolution, which is quick, and is sharpened in the
+    /// background once [`MediaState::fit_to`] knows where it is drawn.
+    pub fn open(kind: MediaKind, path: &Path, fit_px: Option<(u32, u32)>) -> Result<Self> {
         let mtime = path
             .metadata()
             .and_then(|m| m.modified())
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        let (raster, page_count) = match kind {
-            MediaKind::Image => (image_to_png(path, mtime)?, None),
-            MediaKind::Pdf => (raster_pdf_page(path, mtime, 0)?, pdf_page_count(path)),
+        let (raster, page_count, dpi) = match kind {
+            MediaKind::Image => (image_to_png(path, mtime)?, None, MIN_PDF_DPI),
+            MediaKind::Pdf => {
+                let info = pdf_info(path);
+                let dpi = match (info.page_pt, fit_px) {
+                    (Some(page_pt), Some(fit_px)) => dpi_to_fit(page_pt, Some(fit_px)),
+                    _ => MIN_PDF_DPI,
+                };
+                (raster_pdf_page(path, mtime, 0, dpi)?, info.page_count, dpi)
+            }
         };
         Ok(Self {
             kind,
@@ -381,8 +432,35 @@ impl MediaState {
             page_count,
             rastered: 0,
             pending: None,
+            dpi,
+            rastered_dpi: dpi,
+            max_dpi: MAX_PDF_DPI,
             raster,
         })
+    }
+
+    /// Size PDF pages for a placement box of `fit_px` pixels, or `None` when
+    /// the terminal does not report its pixel size. Called every frame by
+    /// whatever draws the page. A page on screen that was rendered smaller is
+    /// re-rendered sharper in the background (see
+    /// [`MediaState::take_raster_request`]); one rendered larger is kept, but
+    /// pages turned to afterwards are rendered at the new size.
+    pub fn fit_to(&mut self, fit_px: Option<(u32, u32)>) {
+        if self.kind != MediaKind::Pdf {
+            return;
+        }
+        // The page's size in points, from the raster on screen.
+        let page_pt = (
+            self.raster.width as f32 * 72.0 / self.rastered_dpi as f32,
+            self.raster.height as f32 * 72.0 / self.rastered_dpi as f32,
+        );
+        self.dpi = dpi_to_fit(page_pt, fit_px).min(self.max_dpi);
+    }
+
+    /// Whether [`MediaState::raster`] is not the page, or not the resolution,
+    /// that should be on screen.
+    fn needs_raster(&self) -> bool {
+        self.rastered != self.page || self.rastered_dpi < self.dpi
     }
 
     /// Re-read the file after it changed on disk, staying on the page being
@@ -406,19 +484,19 @@ impl MediaState {
         let (page_count, page, raster) = match self.kind {
             MediaKind::Image => (None, 0, image_to_png(&self.source, mtime)?),
             MediaKind::Pdf => {
-                let page_count = pdf_page_count(&self.source);
+                let page_count = pdf_info(&self.source).page_count;
                 let page = match page_count {
                     Some(count) => self.page.min(count.saturating_sub(1)),
                     None => self.page,
                 };
-                match raster_pdf_page(&self.source, mtime, page) {
+                match raster_pdf_page(&self.source, mtime, page, self.dpi) {
                     Ok(raster) => (page_count, page, raster),
                     // No page count to clamp against and the page is gone:
                     // fall back to the first page, which every document has.
                     Err(err) if page > 0 => (
                         page_count,
                         0,
-                        raster_pdf_page(&self.source, mtime, 0).map_err(|_| err)?,
+                        raster_pdf_page(&self.source, mtime, 0, self.dpi).map_err(|_| err)?,
                     ),
                     Err(err) => return Err(err),
                 }
@@ -428,6 +506,7 @@ impl MediaState {
         self.page_count = page_count;
         self.page = page;
         self.rastered = page;
+        self.rastered_dpi = self.dpi;
         self.raster = raster;
         // A rasterize started against the old file is left to run; its result
         // is discarded by `finish_raster`, which only accepts a request made
@@ -463,6 +542,7 @@ impl MediaState {
             source: self.source.clone(),
             mtime: self.mtime,
             page: self.page,
+            dpi: self.dpi,
         };
         let raster = request.run();
         self.finish_raster(&request, raster)
@@ -478,9 +558,10 @@ impl MediaState {
     /// to date or a rasterize is already running. Only one runs at a time, so
     /// holding a paging key never queues a `pdftoppm` per keystroke: pages
     /// that go by before their turn are never rendered at all, and the one you
-    /// land on is picked up on the next frame.
+    /// land on is picked up on the next frame. The page on screen is also
+    /// re-rendered when it is drawn larger than it was rendered.
     pub fn take_raster_request(&mut self) -> Option<RasterRequest> {
-        if self.kind != MediaKind::Pdf || self.rastered == self.page || self.pending.is_some() {
+        if self.kind != MediaKind::Pdf || !self.needs_raster() || self.pending.is_some() {
             return None;
         }
         self.pending = Some(self.page);
@@ -488,6 +569,7 @@ impl MediaState {
             source: self.source.clone(),
             mtime: self.mtime,
             page: self.page,
+            dpi: self.dpi,
         })
     }
 
@@ -503,11 +585,24 @@ impl MediaState {
         if page != self.page || request.mtime != self.mtime {
             return Ok(());
         }
+        // Nor is a render of the page on screen that is no sharper than it.
+        let resharpen = page == self.rastered;
+        if resharpen && request.dpi <= self.rastered_dpi {
+            return Ok(());
+        }
         match raster {
             Ok(raster) => {
                 self.raster = raster;
                 self.rastered = page;
+                self.rastered_dpi = request.dpi;
                 Ok(())
+            }
+            // The page is still on screen, just blurrier than it could be:
+            // stop asking for the resolution that failed.
+            Err(err) if resharpen => {
+                self.max_dpi = self.rastered_dpi;
+                self.dpi = self.rastered_dpi;
+                Err(err)
             }
             Err(err) => {
                 self.page = self.rastered;
@@ -517,11 +612,12 @@ impl MediaState {
     }
 }
 
-fn cache_slot(source: &Path, mtime: SystemTime, page: usize) -> Result<(PathBuf, u32)> {
+fn cache_slot(source: &Path, mtime: SystemTime, page: usize, dpi: u32) -> Result<(PathBuf, u32)> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     source.hash(&mut hasher);
     mtime.hash(&mut hasher);
     page.hash(&mut hasher);
+    dpi.hash(&mut hasher);
     let h = hasher.finish();
     let id = ((h as u32) & 0xFF_FFFF).max(1);
     let dir = helix_loader::cache_dir().join("media-render");
@@ -529,9 +625,28 @@ fn cache_slot(source: &Path, mtime: SystemTime, page: usize) -> Result<(PathBuf,
     Ok((dir.join(format!("{h:016x}.png")), id))
 }
 
+/// A path next to a cache slot for a converter to write to. Converters write
+/// as they go, so the PNG is moved into the slot only once it is complete:
+/// a converter killed halfway (see [`kill_converters`]) must not leave a
+/// truncated PNG in the slot to be served from then on.
+fn partial_path(cache: &Path) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    cache.with_extension(format!("{}-{n}.part.png", std::process::id()))
+}
+
+/// Move a converter's finished output into its cache slot, or clear it away
+/// if the converter failed.
+fn finish_partial(partial: &Path, cache: &Path, converted: Result<()>) -> Result<()> {
+    let result = converted.and_then(|()| Ok(std::fs::rename(partial, cache)?));
+    if result.is_err() {
+        let _ = std::fs::remove_file(partial);
+    }
+    result
+}
+
 /// Parse width/height out of a PNG's IHDR chunk.
 fn png_dimensions(path: &Path) -> Result<(u32, u32)> {
-    use std::io::Read;
     let mut head = [0u8; 24];
     std::fs::File::open(path)?
         .read_exact(&mut head)
@@ -544,16 +659,79 @@ fn png_dimensions(path: &Path) -> Result<(u32, u32)> {
     Ok((w, h))
 }
 
-/// Run a conversion command, mapping missing binaries to None so callers can
-/// try the next tool.
-fn try_tool(cmd: &str, args: &[&std::ffi::OsStr]) -> Option<Result<()>> {
-    match Command::new(cmd).args(args).output() {
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+/// Converters (`pdftoppm`, `magick`, ...) that are still running, so that
+/// quitting can kill them rather than wait for them. They run on blocking
+/// tasks, which the runtime cannot cancel: a page that takes seconds to
+/// render would otherwise hold up the exit until it is done.
+static CONVERTERS: Mutex<Converters> = Mutex::new(Converters {
+    next: 0,
+    running: Vec::new(),
+    closed: false,
+});
+
+struct Converters {
+    next: u64,
+    /// Each converter with a key for its caller to find it by, and the file it
+    /// is writing.
+    running: Vec<(u64, Child, PathBuf)>,
+    /// Set by [`kill_converters`]: no more converters are started.
+    closed: bool,
+}
+
+/// Kill the converters still running, remove what they were writing, and
+/// start no more. Called when the editor exits.
+pub fn kill_converters() {
+    let mut converters = CONVERTERS.lock();
+    converters.closed = true;
+    for (_, mut child, output) in converters.running.drain(..) {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(output);
+    }
+}
+
+/// Run a conversion command writing to `output`, mapping missing binaries to
+/// None so callers can try the next tool.
+fn try_tool(cmd: &str, args: &[&std::ffi::OsStr], output: &Path) -> Option<Result<()>> {
+    let (key, stderr) = {
+        let mut converters = CONVERTERS.lock();
+        if converters.closed {
+            return Some(Err(anyhow!("`{cmd}` not started: exiting")));
+        }
+        let spawned = Command::new(cmd)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn();
+        let mut child = match spawned {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(err) => return Some(Err(err.into())),
+            Ok(child) => child,
+        };
+        let stderr = child.stderr.take();
+        let key = converters.next;
+        converters.next += 1;
+        converters.running.push((key, child, output.to_path_buf()));
+        (key, stderr)
+    };
+
+    // Reads until the converter exits, or is killed by `kill_converters`.
+    let mut message = String::new();
+    if let Some(mut stderr) = stderr {
+        let _ = stderr.read_to_string(&mut message);
+    }
+    let child = {
+        let mut converters = CONVERTERS.lock();
+        let index = converters.running.iter().position(|(k, ..)| *k == key);
+        index.map(|index| converters.running.swap_remove(index).1)
+    };
+    let Some(mut child) = child else {
+        return Some(Err(anyhow!("`{cmd}` was killed")));
+    };
+    match child.wait() {
         Err(err) => Some(Err(err.into())),
-        Ok(out) if !out.status.success() => Some(Err(anyhow!(
-            "`{cmd}` failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))),
+        Ok(status) if !status.success() => Some(Err(anyhow!("`{cmd}` failed: {}", message.trim()))),
         Ok(_) => Some(Ok(())),
     }
 }
@@ -563,19 +741,21 @@ fn image_to_png(source: &Path, mtime: SystemTime) -> Result<Raster> {
         .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("png"));
-    let (cache, id) = cache_slot(source, mtime, 0)?;
+    let (cache, id) = cache_slot(source, mtime, 0, 0)?;
     let png = if is_png {
         source.to_path_buf()
     } else {
         if !cache.exists() {
+            let partial = partial_path(&cache);
             // `[0]` selects the first frame of animated formats in ImageMagick.
             let magick_src: std::ffi::OsString = {
                 let mut s = source.as_os_str().to_os_string();
                 s.push("[0]");
                 s
             };
-            let converted = try_tool("magick", &[magick_src.as_os_str(), cache.as_os_str()])
-                .or_else(|| try_tool("convert", &[magick_src.as_os_str(), cache.as_os_str()]))
+            let magick_args = [magick_src.as_os_str(), partial.as_os_str()];
+            let converted = try_tool("magick", &magick_args, &partial)
+                .or_else(|| try_tool("convert", &magick_args, &partial))
                 .or_else(|| {
                     try_tool(
                         "sips",
@@ -585,13 +765,14 @@ fn image_to_png(source: &Path, mtime: SystemTime) -> Result<Raster> {
                             "png".as_ref(),
                             source.as_os_str(),
                             "--out".as_ref(),
-                            cache.as_os_str(),
+                            partial.as_os_str(),
                         ],
+                        &partial,
                     )
                 });
             match converted {
-                Some(Ok(())) => {}
-                Some(Err(err)) => return Err(err.context("converting image to PNG")),
+                Some(converted) => finish_partial(&partial, &cache, converted)
+                    .context("converting image to PNG")?,
                 None => bail!("no image converter found (need `magick`, `convert`, or `sips`)"),
             }
         }
@@ -606,18 +787,20 @@ fn image_to_png(source: &Path, mtime: SystemTime) -> Result<Raster> {
     })
 }
 
-fn raster_pdf_page(source: &Path, mtime: SystemTime, page: usize) -> Result<Raster> {
-    let (cache, id) = cache_slot(source, mtime, page)?;
+fn raster_pdf_page(source: &Path, mtime: SystemTime, page: usize, dpi: u32) -> Result<Raster> {
+    let (cache, id) = cache_slot(source, mtime, page, dpi)?;
     if !cache.exists() {
+        let partial = partial_path(&cache);
         // pdftoppm appends ".png" itself with -singlefile; pass the stem.
-        let prefix = cache.with_extension("");
+        let prefix = partial.with_extension("");
         let page_arg = (page + 1).to_string();
+        let dpi_arg = dpi.to_string();
         let ran = try_tool(
             "pdftoppm",
             &[
                 "-png".as_ref(),
                 "-r".as_ref(),
-                "288".as_ref(),
+                dpi_arg.as_str().as_ref(),
                 "-f".as_ref(),
                 page_arg.as_str().as_ref(),
                 "-l".as_ref(),
@@ -626,14 +809,14 @@ fn raster_pdf_page(source: &Path, mtime: SystemTime, page: usize) -> Result<Rast
                 source.as_os_str(),
                 prefix.as_os_str(),
             ],
+            &partial,
         );
         match ran {
-            Some(Ok(())) => {}
-            Some(Err(err)) => return Err(err.context("rasterizing PDF page")),
+            Some(Ok(())) if !partial.exists() => {
+                bail!("no page {} in {}", page + 1, source.display())
+            }
+            Some(ran) => finish_partial(&partial, &cache, ran).context("rasterizing PDF page")?,
             None => bail!("`pdftoppm` (poppler) is required to render PDFs"),
-        }
-        if !cache.exists() {
-            bail!("no page {} in {}", page + 1, source.display());
         }
     }
     let (width, height) = png_dimensions(&cache)?;
@@ -645,15 +828,34 @@ fn raster_pdf_page(source: &Path, mtime: SystemTime, page: usize) -> Result<Rast
     })
 }
 
-fn pdf_page_count(source: &Path) -> Option<usize> {
-    let out = Command::new("pdfinfo").arg(source).output().ok()?;
+/// What `pdfinfo` reports about a PDF.
+struct PdfInfo {
+    page_count: Option<usize>,
+    /// Width and height of the first page, in points.
+    page_pt: Option<(f32, f32)>,
+}
+
+fn pdf_info(source: &Path) -> PdfInfo {
+    let mut info = PdfInfo {
+        page_count: None,
+        page_pt: None,
+    };
+    let Ok(out) = Command::new("pdfinfo").arg(source).output() else {
+        return info;
+    };
     if !out.status.success() {
-        return None;
+        return info;
     }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .find_map(|l| l.strip_prefix("Pages:"))
-        .and_then(|v| v.trim().parse().ok())
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Some(pages) = line.strip_prefix("Pages:") {
+            info.page_count = pages.trim().parse().ok();
+        } else if let Some(size) = line.strip_prefix("Page size:") {
+            // "612 x 792 pts (letter)"
+            let mut dims = size.split_whitespace().filter_map(|v| v.parse().ok());
+            info.page_pt = dims.next().zip(dims.next());
+        }
+    }
+    info
 }
 
 #[cfg(test)]
@@ -745,6 +947,9 @@ mod tests {
             page_count,
             rastered: 0,
             pending: None,
+            dpi: MIN_PDF_DPI,
+            rastered_dpi: MIN_PDF_DPI,
+            max_dpi: MAX_PDF_DPI,
             raster: test_raster(1),
         }
     }
@@ -813,6 +1018,58 @@ mod tests {
         let mut state = pdf_state(Some(3));
         assert!(state.goto_page(3).is_err());
         assert_eq!(state.page, 0);
+    }
+
+    #[test]
+    fn pages_render_at_the_lowest_resolution_that_fills_the_box() {
+        // A US letter page, 612x792 pt.
+        let letter = (612.0, 792.0);
+        // Exactly at a step stays on it; just past one rounds up.
+        assert_eq!(dpi_to_fit(letter, Some((612, 792))), 72);
+        assert_eq!(dpi_to_fit(letter, Some((613, 2000))), 96);
+        // Height-limited: a wide box is no reason to render sharper.
+        assert_eq!(dpi_to_fit(letter, Some((5000, 1600))), 192);
+        // Capped at the sharpest step, and used when there is no box.
+        assert_eq!(dpi_to_fit(letter, Some((10_000, 10_000))), MAX_PDF_DPI);
+        assert_eq!(dpi_to_fit(letter, None), MAX_PDF_DPI);
+    }
+
+    #[test]
+    fn a_page_drawn_larger_than_rendered_is_sharpened() {
+        // The test raster is 1000x1000 px at 72 DPI: a 1000x1000 pt page.
+        let mut state = pdf_state(Some(10));
+        state.fit_to(Some((1000, 1000)));
+        assert!(state.take_raster_request().is_none(), "already sharp enough");
+
+        // The view grows: the same page is rendered again, sharper.
+        state.fit_to(Some((2000, 1500)));
+        let request = state.take_raster_request().expect("page re-renders");
+        assert_eq!((request.page(), request.dpi), (0, 144));
+        assert!(!state.is_rastering(), "no page is being turned");
+        state.finish_raster(&request, Ok(test_raster(2))).unwrap();
+        assert_eq!(state.raster.id, 2);
+
+        // Shrinking keeps the sharper raster rather than rendering again ...
+        state.fit_to(Some((500, 500)));
+        assert!(state.take_raster_request().is_none());
+        // ... but the next page is rendered for the smaller view.
+        state.goto_page(1).unwrap();
+        let request = state.take_raster_request().expect("page 2 rasterizes");
+        assert_eq!(request.dpi, 72);
+    }
+
+    #[test]
+    fn a_sharper_render_that_fails_is_not_retried() {
+        let mut state = pdf_state(Some(10));
+        state.fit_to(Some((3000, 3000)));
+        let request = state.take_raster_request().expect("page re-renders");
+        assert!(state
+            .finish_raster(&request, Err(anyhow!("out of memory")))
+            .is_err());
+        // The page stays on screen as it was, and is not asked for again.
+        assert_eq!((state.page, state.raster.id), (0, 1));
+        state.fit_to(Some((3000, 3000)));
+        assert!(state.take_raster_request().is_none());
     }
 
     #[test]
