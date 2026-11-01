@@ -436,7 +436,10 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     /// An event handler for syntax highlighting the currently previewed file.
     preview_highlight_handler: Sender<Arc<Path>>,
     /// An event handler for rasterizing the currently previewed image or PDF.
-    preview_media_handler: Sender<Arc<Path>>,
+    preview_media_handler: Sender<(Arc<Path>, Option<(u32, u32)>)>,
+    /// Size in pixels of the box a previewed image or PDF page is drawn in, if
+    /// the terminal reports its pixel size: PDF pages are rendered to fill it.
+    preview_fit_px: Option<(u32, u32)>,
     dynamic_query_handler: Option<Sender<DynamicQueryChange>>,
 
     /// Vertical scroll of the preview relative to its natural top. Positive
@@ -581,6 +584,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             file_fn: None,
             preview_highlight_handler: PreviewHighlightHandler::<T, D>::default().spawn(),
             preview_media_handler: PreviewMediaHandler::<T, D>::default().spawn(),
+            preview_fit_px: None,
             dynamic_query_handler: None,
             preview_scroll_offset: 0,
             preview_height: 0,
@@ -939,7 +943,9 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     /// Kick off the rasterize for a PDF preview that has been paged, if one is
     /// outstanding and none is already running. Called every frame, as the
     /// editor's media view does, so the page landed on is picked up even when
-    /// several pages went by while a rasterize was in flight.
+    /// several pages went by while a rasterize was in flight. The page is
+    /// re-rendered sharper, too, when the preview is larger than it was
+    /// rendered for.
     fn request_media_raster(&mut self, editor: &mut Editor) {
         if editor.graphics.mode == GraphicsMode::None {
             return;
@@ -950,6 +956,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         let Some(media) = Self::media_state_mut(&mut self.preview_cache, editor, &target) else {
             return;
         };
+        media.fit_to(self.preview_fit_px);
         let Some(request) = media.take_raster_request() else {
             return;
         };
@@ -1111,7 +1118,10 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                         preview,
                         CachedPreview::Media(MediaPreview::Rendering { started: false, .. })
                     ) {
-                        helix_event::send_blocking(&self.preview_media_handler, path.clone());
+                        helix_event::send_blocking(
+                            &self.preview_media_handler,
+                            (path.clone(), self.preview_fit_px),
+                        );
                     }
                     return Some((Preview::Cached(preview), range));
                 }
@@ -1202,7 +1212,10 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                     preview,
                     CachedPreview::Media(MediaPreview::Rendering { started: false, .. })
                 ) {
-                    helix_event::send_blocking(&self.preview_media_handler, path.clone());
+                    helix_event::send_blocking(
+                        &self.preview_media_handler,
+                        (path.clone(), self.preview_fit_px),
+                    );
                 }
                 self.preview_cache.insert(path.clone(), preview);
                 Some((Preview::Cached(&self.preview_cache[&path]), range))
@@ -1468,6 +1481,11 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             self.preview_scroll_offset = 0;
             self.preview_scroll_cursor = self.cursor;
         }
+
+        // The box an image or PDF page is drawn in: the last line is left for
+        // the caption.
+        self.preview_fit_px =
+            ui::media::fit_px(&cx.editor.graphics, surface.area, inner.clip_bottom(1));
 
         // Pick up the rasterize for a PDF preview that has been paged. Must
         // happen before `get_preview` borrows the editor.
