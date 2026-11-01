@@ -8,7 +8,7 @@ use helix_core::file_watcher::{Event, EventType, FileSystemDidChange};
 use helix_core::hashmap;
 use helix_event::register_hook;
 use helix_view::{
-    editor::{ClipboardMode, ExplorerClipboard},
+    editor::{ClipboardMode, Config as EditorConfig, ExplorerClipboard},
     theme::Style,
     Editor,
 };
@@ -1047,6 +1047,13 @@ pub fn file_explorer(root: PathBuf, editor: &Editor) -> Result<FileExplorer, std
     file_explorer_with_mode(cursor, None, root, editor)
 }
 
+/// Whether the explorer is modal: `editor.file-explorer.modal` when it is set,
+/// so that the explorer can be modal while the other pickers are not (or the
+/// other way round), and `editor.picker.modal` otherwise.
+fn explorer_is_modal(config: &EditorConfig) -> bool {
+    config.file_explorer.modal.unwrap_or(config.picker.modal)
+}
+
 /// As [`file_explorer`], but opening in `mode`, or in the configured default
 /// mode when that is `None`.
 ///
@@ -1121,6 +1128,7 @@ fn file_explorer_with_mode(
     )
     .with_initial_cursor(cursor)
     .with_mode_handle(mode)
+    .with_modal_config(explorer_is_modal)
     .with_preview(|_editor, (path, _is_dir, _symlink)| Some((path.as_path().into(), None)))
     .with_key_handlers(hashmap! {
         // Tree navigation, spelled after the `h`/`l` of the modal layout below
@@ -1144,8 +1152,9 @@ fn file_explorer_with_mode(
         alt!('p') => directory_operation_key(paste_clipboard),
     })
     // A yazi-like layout on unmodified keys, live only in the normal mode of a
-    // modal picker (`editor.picker.modal`). Normal mode never types into the
-    // query, so plain letters are free here in a way they are not above.
+    // modal picker (`editor.file-explorer.modal`, falling back on
+    // `editor.picker.modal`). Normal mode never types into the query, so plain
+    // letters are free here in a way they are not above.
     //
     // Unlike yazi, `d` cuts and `D` deletes: there is no trash to send an entry
     // to, so the shifted key takes the unrecoverable operation. `c` is left
@@ -1244,6 +1253,23 @@ mod test {
     use super::*;
 
     use helix_core::file_watcher::CanonicalPathBuf;
+
+    #[test]
+    fn the_explorer_follows_the_picker_setting_unless_it_has_its_own() {
+        let mut config = EditorConfig::default();
+        for picker_modal in [false, true] {
+            config.picker.modal = picker_modal;
+
+            config.file_explorer.modal = None;
+            assert_eq!(explorer_is_modal(&config), picker_modal);
+
+            config.file_explorer.modal = Some(true);
+            assert!(explorer_is_modal(&config));
+
+            config.file_explorer.modal = Some(false);
+            assert!(!explorer_is_modal(&config));
+        }
+    }
 
     fn fs_event(path: &str, ty: EventType) -> Event {
         Event {
