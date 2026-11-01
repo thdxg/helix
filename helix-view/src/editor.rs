@@ -250,9 +250,13 @@ pub struct FileExplorerConfig {
     pub git_exclude: bool,
     /// Whether to flatten single-child directories in file explorer. Defaults to true.
     pub flatten_dirs: bool,
-    /// Which mode the file explorer opens in, when `editor.picker.modal` is
-    /// enabled. Defaults to `normal`: the explorer is driven with bare keys
-    /// much more often than it is filtered by name.
+    /// Whether the file explorer supports modal editing, overriding
+    /// `editor.picker.modal` for the explorer alone. Unset by default, in which
+    /// case the explorer follows `editor.picker.modal` like every other picker.
+    pub modal: Option<bool>,
+    /// Which mode the file explorer opens in, when it is modal (see
+    /// [`FileExplorerConfig::modal`]). Defaults to `normal`: the explorer is
+    /// driven with bare keys much more often than it is filtered by name.
     pub default_mode: PickerModeConfig,
 }
 
@@ -267,6 +271,7 @@ impl Default for FileExplorerConfig {
             git_global: false,
             git_exclude: false,
             flatten_dirs: true,
+            modal: None,
             default_mode: PickerModeConfig::Normal,
         }
     }
@@ -550,7 +555,8 @@ pub struct PickerConfig {
     /// Whether pickers support modal editing: `Esc` leaves the query and enters
     /// a normal mode where unmodified keys drive the picker instead of typing
     /// into the query. Defaults to `false`, in which case `Esc` closes the
-    /// picker as it always has.
+    /// picker as it always has. The file explorer can override this under
+    /// `editor.file-explorer.modal`.
     pub modal: bool,
     /// Which mode a picker opens in, when `modal` is enabled. Defaults to
     /// `insert`, so that typing filters right away. The file explorer has its
