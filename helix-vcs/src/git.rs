@@ -104,14 +104,14 @@ pub fn get_head_state_paths(path: &Path) -> Vec<PathBuf> {
         return Vec::new();
     };
     let repo = repo.to_thread_local();
-    // A linked worktree records its common directory relative to its own git
-    // directory (`.git/worktrees/<name>/../..`): resolve it so the paths match the
-    // canonical ones the watcher reports.
-    let common_dir = repo
-        .common_dir()
-        .canonicalize()
-        .unwrap_or_else(|_| repo.common_dir().to_path_buf());
-    let mut paths = vec![repo.git_dir().join("HEAD"), common_dir.join("packed-refs")];
+    // The watcher reports canonical paths, so resolve both directories: a linked
+    // worktree records its common directory relative to its own git directory
+    // (`.git/worktrees/<name>/../..`), and on Windows gix hands out the git
+    // directory without the `\\?\` prefix a canonical path carries.
+    let canonical = |dir: &Path| dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let git_dir = canonical(repo.git_dir());
+    let common_dir = canonical(repo.common_dir());
+    let mut paths = vec![git_dir.join("HEAD"), common_dir.join("packed-refs")];
     if let Ok(Some(branch)) = repo.head_name() {
         if let Ok(branch) = gix::path::try_from_bstr(branch.as_bstr()) {
             paths.push(common_dir.join(branch));
