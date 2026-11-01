@@ -19,11 +19,20 @@ fn setup_logging(verbosity: u64) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let exit_code = main_impl()?;
-    std::process::exit(exit_code);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(main_impl());
+    // Dropping the runtime would wait for every blocking task still running,
+    // such as a picker preview's `pdftoppm`, which can take many seconds on
+    // a heavy page. Nothing left on the blocking pool needs finishing: writes
+    // are flushed before the event loop returns. So kill the converters and
+    // leave the rest behind.
+    helix_view::media::kill_converters();
+    runtime.shutdown_background();
+    std::process::exit(result?);
 }
 
-#[tokio::main]
 async fn main_impl() -> Result<i32> {
     let mut args = Args::parse_args().context("could not parse arguments")?;
 

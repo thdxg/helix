@@ -114,9 +114,10 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> AsyncHook
 
 /// Rasterizes the image or PDF under the cursor so the preview can draw it.
 /// Debounced like [`PreviewHighlightHandler`]: scrolling past a directory of
-/// images should not shell out to `magick` for every one of them.
+/// images should not shell out to `magick` for every one of them. A PDF's
+/// page is rendered to fill the pixel box sent along with the path.
 pub(super) struct PreviewMediaHandler<T: 'static + Send + Sync, D: 'static + Send + Sync> {
-    trigger: Option<Arc<Path>>,
+    trigger: Option<(Arc<Path>, Option<(u32, u32)>)>,
     phantom_data: std::marker::PhantomData<(T, D)>,
 }
 
@@ -130,28 +131,28 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Default for PreviewMedi
 }
 
 impl<T: 'static + Send + Sync, D: 'static + Send + Sync> AsyncHook for PreviewMediaHandler<T, D> {
-    type Event = Arc<Path>;
+    type Event = (Arc<Path>, Option<(u32, u32)>);
 
     fn handle_event(
         &mut self,
-        path: Self::Event,
+        (path, fit_px): Self::Event,
         timeout: Option<tokio::time::Instant>,
     ) -> Option<tokio::time::Instant> {
-        if self
-            .trigger
-            .as_ref()
-            .is_some_and(|trigger| trigger == &path)
-        {
+        match &mut self.trigger {
             // If the path hasn't changed, don't reset the debounce
-            timeout
-        } else {
-            self.trigger = Some(path);
-            Some(Instant::now() + Duration::from_millis(150))
+            Some((trigger, trigger_fit_px)) if trigger == &path => {
+                *trigger_fit_px = fit_px;
+                timeout
+            }
+            _ => {
+                self.trigger = Some((path, fit_px));
+                Some(Instant::now() + Duration::from_millis(150))
+            }
         }
     }
 
     fn finish_debounce(&mut self) {
-        let Some(path) = self.trigger.take() else {
+        let Some((path, fit_px)) = self.trigger.take() else {
             return;
         };
 
@@ -176,7 +177,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> AsyncHook for PreviewMe
             let kind = *kind;
 
             tokio::task::spawn_blocking(move || {
-                let media = helix_view::media::MediaState::open(kind, &path);
+                let media = helix_view::media::MediaState::open(kind, &path, fit_px);
 
                 job::dispatch_blocking(move |_editor, compositor| {
                     let Some(Overlay {

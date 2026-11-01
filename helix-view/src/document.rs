@@ -844,8 +844,10 @@ impl Document {
         // Images and PDFs open as rendered media documents instead of text.
         if path.exists() {
             if let Some(kind) = crate::media::detect_kind(path) {
-                let media =
-                    crate::media::MediaState::open(kind, path).map_err(DocumentOpenError::Media)?;
+                // Opened at the lowest resolution: this blocks the editor, and
+                // the view sharpens the page in the background once drawn.
+                let media = crate::media::MediaState::open(kind, path, None)
+                    .map_err(DocumentOpenError::Media)?;
                 let mut doc = Self::from(
                     Rope::from(helix_core::NATIVE_LINE_ENDING.as_str()),
                     None,
