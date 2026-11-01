@@ -6,12 +6,14 @@ use futures_util::FutureExt;
 use helix_core::auto_pairs::AutoPairs;
 use helix_core::chars::char_is_word;
 use helix_core::command_line::Token;
+use helix_core::conceal;
 use helix_core::diagnostic::DiagnosticProvider;
 use helix_core::doc_formatter::TextFormat;
 use helix_core::encoding::Encoding;
 use helix_core::fold::{self, FoldSpan, Folds};
 use helix_core::snippets::{ActiveSnippet, SnippetRenderCtx};
 use helix_core::syntax::config::LanguageServerFeature;
+use helix_core::text_annotations::Conceal;
 use helix_core::text_annotations::{InlineAnnotation, Overlay};
 use helix_event::TaskController;
 use helix_lsp::util::lsp_pos_to_pos;
@@ -132,6 +134,17 @@ pub struct SavePoint {
     revert: Mutex<Transaction>,
 }
 
+/// The hidden markup of one view, with the state it was computed from. See
+/// [`Document::update_conceals`].
+#[derive(Debug)]
+struct ConcealCache {
+    version: i32,
+    selection: Selection,
+    /// The document lines (end exclusive) the conceals were computed for, sorted.
+    windows: Vec<std::ops::Range<usize>>,
+    conceals: Vec<Conceal>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DocumentOpenError {
     #[error("path must be a regular file, symlink, or directory")]
@@ -165,6 +178,9 @@ pub struct Document {
     /// Cache of `fold_spans()`. Computing it walks the whole syntax tree, so it is invalidated
     /// (see `apply_impl`) rather than recomputed on every fold command.
     fold_spans_cache: Option<Vec<FoldSpan>>,
+    /// The hidden markup (`editor.conceal`) of the document, per view: what is hidden depends
+    /// on the view's selection and scroll position. See [`Document::update_conceals`].
+    conceals: HashMap<ViewId, ConcealCache>,
     /// Set to `true` when the document is updated, reset to `false` on the next inlay hints
     /// update from the LSP
     pub inlay_hints_oudated: bool,
@@ -804,6 +820,7 @@ impl Document {
             code_action_hints: HashSet::new(),
             folds: HashMap::new(),
             fold_spans_cache: None,
+            conceals: HashMap::new(),
             color_swatches: None,
             document_links: Vec::new(),
             color_swatch_controller: TaskController::new(),
@@ -1500,6 +1517,92 @@ impl Document {
         self.folds.insert(view_id, folds);
     }
 
+    /// The hidden markup of `view_id`, sorted and non-overlapping. See
+    /// [`Self::update_conceals`].
+    pub fn conceals(&self, view_id: ViewId) -> &[Conceal] {
+        self.conceals
+            .get(&view_id)
+            .map_or(&[], |cache| cache.conceals.as_slice())
+    }
+
+    /// Brings the hidden markup (`editor.conceal`) of `view` up to date, if the document, the
+    /// view's selection or the lines it shows changed since the last time.
+    ///
+    /// Lines that hold any part of the view's selection are shown as they are in the file,
+    /// so the markup is always visible where it is edited. Only the lines around the viewport
+    /// and around the primary cursor are computed; the rest of the document is concealed as
+    /// it scrolls into view. The result feeds [`View::text_annotations`], so this runs before
+    /// the view is scrolled or drawn, see [`View::ensure_cursor_in_view`].
+    pub fn update_conceals(&mut self, view: &View) {
+        let enabled = self.config.load().conceal;
+        let (Some(syntax), Some(selection), true) =
+            (self.syntax.as_ref(), self.selections.get(&view.id), enabled)
+        else {
+            self.conceals.remove(&view.id);
+            return;
+        };
+
+        let text = self.text.slice(..);
+        let len_lines = text.len_lines();
+        let height = view.inner_height().max(1);
+        let anchor = self.view_offset(view.id).anchor.min(text.len_chars());
+        let anchor_line = text.char_to_line(anchor);
+        let cursor_line = text.char_to_line(selection.primary().cursor(text));
+        let around = |line: usize, before: usize, after: usize| {
+            line.saturating_sub(before)..(line + after).min(len_lines)
+        };
+        // The viewport with a screen of slack on either side for scrolling, plus the lines
+        // around the cursor, which may be about to be scrolled to.
+        let mut windows = vec![around(anchor_line, height, 2 * height)];
+        let cursor_window = around(cursor_line, height, height);
+        if cursor_window.start <= windows[0].end && windows[0].start <= cursor_window.end {
+            windows[0] =
+                windows[0].start.min(cursor_window.start)..windows[0].end.max(cursor_window.end);
+        } else {
+            windows.push(cursor_window);
+            windows.sort_unstable_by_key(|window| window.start);
+        }
+
+        if let Some(cache) = self.conceals.get(&view.id) {
+            if cache.version == self.version
+                && cache.windows == windows
+                && &cache.selection == selection
+            {
+                return;
+            }
+        }
+
+        let revealed: Vec<std::ops::Range<usize>> = selection
+            .ranges()
+            .iter()
+            .map(|range| {
+                let first = text.char_to_line(range.from());
+                let last = text.char_to_line(range.to().saturating_sub(1).max(range.from()));
+                first..last + 1
+            })
+            .collect();
+        let loader = self.syn_loader.load();
+        let mut conceals = Vec::new();
+        for window in &windows {
+            conceals.extend(conceal::conceal_ranges(
+                syntax,
+                text,
+                &loader,
+                window.clone(),
+                |line| revealed.iter().any(|lines| lines.contains(&line)),
+            ));
+        }
+        self.conceals.insert(
+            view.id,
+            ConcealCache {
+                version: self.version,
+                selection: selection.clone(),
+                windows,
+                conceals,
+            },
+        );
+    }
+
     /// Computes the regions of the document that can be folded.
     ///
     /// These are every named tree-sitter node that spans more than one line, which needs no
@@ -1649,6 +1752,7 @@ impl Document {
         self.code_action_hints.remove(&view_id);
         self.code_action_controllers.remove(&view_id);
         self.folds.remove(&view_id);
+        self.conceals.remove(&view_id);
     }
 
     /// Apply a [`Transaction`] to the [`Document`] to change its text.
@@ -1703,6 +1807,10 @@ impl Document {
             folds.map(new_text, changes);
         }
         self.fold_spans_cache = None;
+        // Hidden ranges are char positions in the old text. Rather than mapping them through
+        // the change they are dropped (nothing is hidden) until the next `update_conceals`,
+        // which runs before the view is scrolled or drawn again.
+        self.conceals.clear();
 
         // generate revert to savepoint
         if !self.savepoints.is_empty() {

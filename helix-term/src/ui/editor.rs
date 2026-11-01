@@ -1991,6 +1991,15 @@ impl Component for EditorView {
         };
         self.rendered_views
             .retain(|id, _| views.iter().any(|(view_id, _)| view_id == id));
+        // Hidden markup depends on each view's selection and scroll position, so it is
+        // brought up to date right before the views are drawn with it.
+        for &(view_id, _) in &views {
+            let editor = &mut *cx.editor;
+            let view = editor.tree.get(view_id);
+            if let Some(doc) = editor.documents.get_mut(&view.doc) {
+                doc.update_conceals(view);
+            }
+        }
         for (view_id, is_focused) in views {
             self.render_view(
                 cx.editor.tree.get(view_id).doc,

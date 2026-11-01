@@ -71,6 +71,7 @@
 | `clipboard-provider` | Which API to use for clipboard interaction. One of `pasteboard` (MacOS), `wayland`, `x-clip`, `x-sel`, `win32-yank`, `termux`, `tmux`, `windows`, `termcode`, `none`, or a custom command set. | Platform and environment specific. |
 | `editor-config` | Whether to read settings from [EditorConfig](https://editorconfig.org) files | `true` |
 | `rainbow-brackets` | Whether to render rainbow colors for matching brackets. Requires tree-sitter `rainbows.scm` queries for the language. | `false` |
+| `conceal` | Whether to hide markup, such as the `**` around bold text or the `#` of a heading, in languages that ship a tree-sitter `conceal.scm` query (markdown). Lines holding a cursor or selection show the markup. Toggle with `:toggle conceal`. | `true` |
 | `kitty-keyboard-protocol` | Whether to enable Kitty Keyboard Protocol. Can be `enabled`, `disabled` or `auto` | `"auto"` |
 | `image-rendering` | Graphical rendering of images/PDFs via the kitty graphics protocol. Can be `auto` (detect kitty/ghostty terminals), `kitty` (force) or `disabled` | `"auto"` |
 

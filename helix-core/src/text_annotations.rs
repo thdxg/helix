@@ -80,6 +80,33 @@ impl Overlay {
     }
 }
 
+/// A range of document text that is not displayed.
+///
+/// The text in `start..end` (char indices) is collapsed into a single grapheme that is
+/// either empty (zero width) or `replacement`, so that hiding markup such as the `**`
+/// around bold markdown does not move the rest of the line. A concealed range never
+/// contains a line break: hiding one would merge two document lines into one row.
+///
+/// Conceals are computed per view from `conceal.scm` queries, see [`crate::conceal`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conceal {
+    pub start: usize,
+    pub end: usize,
+    /// What is displayed in place of the hidden text. Empty to hide it entirely. The first
+    /// grapheme is rendered with the syntax highlight of the hidden text, like an [`Overlay`].
+    pub replacement: Tendril,
+}
+
+impl Conceal {
+    pub fn new(start: usize, end: usize, replacement: impl Into<Tendril>) -> Self {
+        Self {
+            start,
+            end,
+            replacement: replacement.into(),
+        }
+    }
+}
+
 /// Line annotations allow inserting virtual text lines between normal text
 /// lines.  These lines can be filled with text in the rendering code as their
 /// contents have no effect beyond visual appearance.
@@ -285,6 +312,10 @@ pub struct TextAnnotations<'a> {
     /// Index of the next fold the formatter has not passed yet
     fold_idx: Cell<usize>,
     fold_highlight: Option<Highlight>,
+    /// Hidden text, sorted and non-overlapping. See [`TextAnnotations::add_conceals`].
+    conceals: &'a [Conceal],
+    /// Index of the next conceal the formatter has not passed yet
+    conceal_idx: Cell<usize>,
 }
 
 impl Debug for TextAnnotations<'_> {
@@ -293,6 +324,7 @@ impl Debug for TextAnnotations<'_> {
             .field("inline_annotations", &self.inline_annotations)
             .field("overlays", &self.overlays)
             .field("folds", &self.folds)
+            .field("conceals", &self.conceals)
             .finish_non_exhaustive()
     }
 }
@@ -307,6 +339,8 @@ impl<'a> TextAnnotations<'a> {
         }
         self.fold_idx
             .set(self.folds.partition_point(|fold| fold.start < char_idx));
+        self.conceal_idx
+            .set(self.conceals.partition_point(|c| c.start < char_idx));
     }
 
     pub fn collect_overlay_highlights(&self, char_range: Range<usize>) -> OverlayHighlights {
@@ -393,6 +427,34 @@ impl<'a> TextAnnotations<'a> {
 
     pub fn has_folds(&self) -> bool {
         !self.folds.is_empty()
+    }
+
+    /// Add hidden text.
+    ///
+    /// Each [`Conceal`] collapses `start..end` into its replacement (or nothing). The
+    /// conceals **must be sorted**, **must not overlap** and **must not contain line breaks**.
+    pub fn add_conceals(&mut self, conceals: &'a [Conceal]) -> &mut Self {
+        self.conceals = conceals;
+        self
+    }
+
+    /// Returns the conceal that starts at `char_idx`.
+    ///
+    /// Must be called with monotonically increasing `char_idx`, the same as for other
+    /// annotations.
+    pub(crate) fn conceal_at(&self, char_idx: usize) -> Option<&Conceal> {
+        let mut idx = self.conceal_idx.get();
+        while self
+            .conceals
+            .get(idx)
+            .is_some_and(|conceal| conceal.start < char_idx)
+        {
+            idx += 1;
+        }
+        self.conceal_idx.set(idx);
+        self.conceals
+            .get(idx)
+            .filter(|conceal| conceal.start == char_idx)
     }
 
     /// Returns the document line that is displayed where `line` would be: `line` itself

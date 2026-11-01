@@ -351,12 +351,16 @@ impl View {
     }
 
     pub fn ensure_cursor_in_view(&self, doc: &mut Document, scrolloff: usize) {
+        // Hidden markup changes the layout and depends on the selection, so it is brought up
+        // to date before the scroll offset is computed from the layout.
+        doc.update_conceals(self);
         if let Some(offset) = self.offset_coords_to_in_view_center::<false>(doc, scrolloff) {
             doc.set_view_offset(self.id, offset);
         }
     }
 
     pub fn ensure_cursor_in_view_center(&self, doc: &mut Document, scrolloff: usize) {
+        doc.update_conceals(self);
         if let Some(offset) = self.offset_coords_to_in_view_center::<true>(doc, scrolloff) {
             doc.set_view_offset(self.id, offset);
         } else {
@@ -469,6 +473,11 @@ impl View {
                     .or_else(|| t.find_highlight("comment"))
             });
             text_annotations.add_folds(folds.folded(), style);
+        }
+
+        let conceals = doc.conceals(self.id);
+        if !conceals.is_empty() {
+            text_annotations.add_conceals(conceals);
         }
 
         if let Some(labels) = doc.jump_labels.get(&self.id) {

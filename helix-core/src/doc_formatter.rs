@@ -195,6 +195,10 @@ pub struct DocumentFormatter<'t> {
     /// The `char_pos` at which the placeholder of a fold was already yielded
     fold_placeholder_pos: usize,
 
+    /// The remaining graphemes of a conceal replacement that is longer than one grapheme,
+    /// and how many of the hidden chars are still left to spread over them.
+    conceal_rest: Option<(Graphemes<'t>, usize)>,
+
     // softwrap specific
     /// The indentation of the current line
     /// Is set to `None` if the indentation level is not yet known
@@ -244,6 +248,29 @@ impl<'t> DocumentFormatter<'t> {
             inline_annotation_graphemes: None,
             fold_placeholder: None,
             fold_placeholder_pos: usize::MAX,
+            conceal_rest: None,
+        }
+    }
+
+    /// Yields the rest of a conceal replacement that is longer than one grapheme, see
+    /// [`Self::advance_grapheme`]. Each grapheme stands in for one of the hidden chars for
+    /// as long as there are any left, so that none of them is mistaken for the EOF grapheme.
+    fn next_conceal_replacement_grapheme(&mut self) -> Option<(&'t str, GraphemeSource)> {
+        let (graphemes, reserved) = self.conceal_rest.as_mut()?;
+        match graphemes.next() {
+            Some(grapheme) => {
+                let source = if *reserved > 0 {
+                    *reserved -= 1;
+                    GraphemeSource::Document { codepoints: 1 }
+                } else {
+                    GraphemeSource::VirtualText { highlight: None }
+                };
+                Some((grapheme, source))
+            }
+            None => {
+                self.conceal_rest = None;
+                None
+            }
         }
     }
 
@@ -300,9 +327,11 @@ impl<'t> DocumentFormatter<'t> {
     }
 
     fn advance_grapheme(&mut self, col: usize, char_pos: usize) -> Option<GraphemeWithSource<'t>> {
-        let (grapheme, source) = if let Some((grapheme, highlight)) =
-            self.next_inline_annotation_grapheme(char_pos)
+        let (grapheme, source) = if let Some((grapheme, source)) =
+            self.next_conceal_replacement_grapheme()
         {
+            (grapheme.into(), source)
+        } else if let Some((grapheme, highlight)) = self.next_inline_annotation_grapheme(char_pos) {
             (grapheme.into(), GraphemeSource::VirtualText { highlight })
         } else if let Some((grapheme, highlight)) = self.next_fold_placeholder_grapheme(char_pos) {
             (grapheme.into(), GraphemeSource::VirtualText { highlight })
@@ -311,9 +340,10 @@ impl<'t> DocumentFormatter<'t> {
 
             let overlay = self.annotations.overlay_at(char_pos);
 
+            let is_line_ending = LineEnding::from_rope_slice(&grapheme).is_some();
             // The line ending of a folded header line swallows everything that is hidden by
             // the fold: it is yielded as a single grapheme that spans all the hidden text.
-            if LineEnding::from_rope_slice(&grapheme).is_some() {
+            if is_line_ending {
                 if let Some(fold) = self.annotations.fold_at(char_pos) {
                     if fold.end <= self.text.len_chars() {
                         codepoints = (fold.end - char_pos) as u32;
@@ -323,9 +353,37 @@ impl<'t> DocumentFormatter<'t> {
                 }
             }
 
-            let grapheme = match overlay {
-                Some((overlay, _)) => overlay.grapheme.as_str().into(),
-                None => Cow::from(grapheme).into(),
+            // Concealed text is collapsed into one grapheme: the first grapheme of the
+            // replacement, or an empty (zero width) one. Further replacement graphemes are
+            // yielded next, each standing in for one more of the hidden chars.
+            let mut concealed = None;
+            if !is_line_ending {
+                if let Some(conceal) = self.annotations.conceal_at(char_pos) {
+                    let end = conceal.end.min(self.text.len_chars());
+                    if end > char_pos {
+                        let hidden = end - char_pos;
+                        self.graphemes = self.text.slice(end..).graphemes();
+                        self.annotations.skip_layers_to(end);
+                        let mut replacement =
+                            UnicodeSegmentation::graphemes(&*conceal.replacement, true);
+                        let first = replacement.next().unwrap_or("");
+                        let rest = UnicodeSegmentation::graphemes(&*conceal.replacement, true)
+                            .count()
+                            .saturating_sub(1);
+                        let reserved = rest.min(hidden - 1);
+                        codepoints = (hidden - reserved) as u32;
+                        if rest > 0 {
+                            self.conceal_rest = Some((replacement, reserved));
+                        }
+                        concealed = Some(first);
+                    }
+                }
+            }
+
+            let grapheme = match (concealed, overlay) {
+                (Some(replacement), _) => replacement.into(),
+                (None, Some((overlay, _))) => overlay.grapheme.as_str().into(),
+                (None, None) => Cow::from(grapheme).into(),
             };
 
             (grapheme, GraphemeSource::Document { codepoints })

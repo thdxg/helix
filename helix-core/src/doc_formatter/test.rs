@@ -1,6 +1,6 @@
 use crate::doc_formatter::{DocumentFormatter, TextFormat};
 use crate::fold::{FoldSpan, Folds};
-use crate::text_annotations::{InlineAnnotation, Overlay, TextAnnotations};
+use crate::text_annotations::{Conceal, InlineAnnotation, Overlay, TextAnnotations};
 use crate::Rope;
 
 impl TextFormat {
@@ -334,4 +334,143 @@ fn fold_block_starting_in_hidden_text() {
         );
     }
     assert_eq!(fold_text("a\nb\nc\nd\n", false, &[(0, 2)], &[], 6), "d \n ");
+}
+
+fn conceal_text(text: &str, softwrap: bool, conceals: &[Conceal], char_pos: usize) -> String {
+    let conceals = conceals.to_vec();
+    let mut annotations = TextAnnotations::default();
+    annotations.add_conceals(&conceals);
+    let text_fmt = TextFormat::new_test(softwrap);
+    let res =
+        DocumentFormatter::new_at_prev_checkpoint(text.into(), &text_fmt, &annotations, char_pos)
+            .collect_to_str();
+    res
+}
+
+/// `(grapheme, char_idx, visual col, doc chars, is virtual)` of every grapheme.
+fn conceal_graphemes(text: &str, conceals: &[Conceal]) -> Vec<(String, usize, usize, usize, bool)> {
+    let conceals = conceals.to_vec();
+    let mut annotations = TextAnnotations::default();
+    annotations.add_conceals(&conceals);
+    let text_fmt = TextFormat::new_test(false);
+    let res = DocumentFormatter::new_at_prev_checkpoint(text.into(), &text_fmt, &annotations, 0)
+        .map(|g| {
+            (
+                g.raw.to_string(),
+                g.char_idx,
+                g.visual_pos.col,
+                g.doc_chars(),
+                g.is_virtual(),
+            )
+        })
+        .collect();
+    res
+}
+
+#[test]
+fn conceal_hides_text() {
+    // chars: **0..2 bold2..6 **6..8 ' and '8..13 `13 code14..18 `18 \n19 next20..24
+    let conceals = [
+        Conceal::new(0, 2, ""),
+        Conceal::new(6, 8, ""),
+        Conceal::new(13, 14, ""),
+        Conceal::new(18, 19, ""),
+    ];
+    assert_eq!(
+        conceal_text("**bold** and `code`\nnext", false, &conceals, 0),
+        "bold and code \nnext "
+    );
+    // starting at the second line skips the conceals of the first
+    assert_eq!(
+        conceal_text("**bold** and `code`\nnext", false, &conceals, 20),
+        "next "
+    );
+}
+
+#[test]
+fn conceal_keeps_char_positions() {
+    // The hidden text is one zero-width grapheme that spans all of its chars, so that the
+    // chars after it keep their indices and the visible text does not move.
+    let conceals = [Conceal::new(0, 2, ""), Conceal::new(3, 5, "")];
+    assert_eq!(
+        conceal_graphemes("**b**\n", &conceals),
+        [
+            ("".to_string(), 0, 0, 2, false),
+            ("b".to_string(), 2, 0, 1, false),
+            ("".to_string(), 3, 1, 2, false),
+            (" ".to_string(), 5, 1, 1, false), // the line ending
+            (" ".to_string(), 6, 0, 0, false), // EOF
+        ]
+    );
+}
+
+#[test]
+fn conceal_replacement() {
+    // `-` → `•` and `[x]` → `[✓]`: each replacement grapheme stands in for one hidden char
+    let conceals = [Conceal::new(0, 1, "•"), Conceal::new(2, 5, "[✓]")];
+    assert_eq!(
+        conceal_graphemes("- [x] ok\n", &conceals),
+        [
+            ("•".to_string(), 0, 0, 1, false),
+            (" ".to_string(), 1, 1, 1, false),
+            ("[".to_string(), 2, 2, 1, false),
+            ("✓".to_string(), 3, 3, 1, false),
+            ("]".to_string(), 4, 4, 1, false),
+            (" ".to_string(), 5, 5, 1, false),
+            ("o".to_string(), 6, 6, 1, false),
+            ("k".to_string(), 7, 7, 1, false),
+            (" ".to_string(), 8, 8, 1, false),
+            (" ".to_string(), 9, 0, 0, false),
+        ]
+    );
+}
+
+#[test]
+fn conceal_replacement_longer_than_hidden_text() {
+    // `]` → ` → `: the first grapheme takes the hidden char, the rest is virtual text
+    let conceals = [Conceal::new(1, 2, " → ")];
+    assert_eq!(
+        conceal_graphemes("a]b\n", &conceals),
+        [
+            ("a".to_string(), 0, 0, 1, false),
+            (" ".to_string(), 1, 1, 1, false),
+            ("→".to_string(), 2, 2, 0, true),
+            (" ".to_string(), 2, 3, 0, true),
+            ("b".to_string(), 2, 4, 1, false),
+            (" ".to_string(), 3, 5, 1, false),
+            (" ".to_string(), 4, 0, 0, false),
+        ]
+    );
+}
+
+#[test]
+fn conceal_softwrap() {
+    // the hidden text takes no room, so the visible text wraps as if it were not there
+    let conceals = [Conceal::new(0, 2, ""), Conceal::new(6, 8, "")];
+    assert_eq!(
+        conceal_text("**bold** text that wraps", true, &conceals, 0),
+        "bold text that \nwraps "
+    );
+}
+
+#[test]
+fn conceal_inside_fold_is_skipped() {
+    // line 1 (`**b**`) is folded away together with its conceal; line 2 keeps its own
+    let text = Rope::from("a\n**b**\n`c`\n");
+    let conceals = [
+        Conceal::new(2, 4, ""),
+        Conceal::new(5, 7, ""),
+        Conceal::new(8, 9, ""),
+        Conceal::new(10, 11, ""),
+    ];
+    let mut folds = Folds::default();
+    assert!(folds.close(text.slice(..), FoldSpan::new(0, 1).unwrap()));
+    let mut annotations = TextAnnotations::default();
+    annotations.add_folds(folds.folded(), None);
+    annotations.add_conceals(&conceals);
+    let text_fmt = TextFormat::new_test(false);
+    let rendered =
+        DocumentFormatter::new_at_prev_checkpoint(text.slice(..), &text_fmt, &annotations, 0)
+            .collect_to_str();
+    assert_eq!(rendered, "a … 1 line \nc \n ");
 }
