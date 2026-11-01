@@ -258,7 +258,8 @@ Note that the ignore files consulted by the file explorer when `ignore` is set t
 |`git-global` | Enables reading global `.gitignore`, whose path is specified in git's config: `core.excludesfile` option | `false`
 |`git-exclude` | Enables reading `.git/info/exclude` files | `false`
 |`flatten-dirs` | Enables flattening single child directories. Symlinks are never flattened past, so that they stay visible | `true`
-|`default-mode` | Which mode the file explorer opens in, `insert` or `normal`, when `editor.picker.modal` is enabled | `normal`
+|`modal` | Enables modal editing in the file explorer, overriding `editor.picker.modal` for the explorer alone. Unset, the explorer follows `editor.picker.modal` | unset
+|`default-mode` | Which mode the file explorer opens in, `insert` or `normal`, when the explorer is modal | `normal`
 
 ### `[editor.buffer-picker]` Section
 
@@ -312,6 +313,17 @@ default-mode = "insert"   # ...except the file explorer
 Both are ignored while `modal = false`, the default, in which case pickers behave
 exactly as they always have: <kbd>Esc</kbd> closes the picker and there is no
 normal mode to enter. The `Ctrl` bindings work the same either way.
+
+The file explorer can also be made modal on its own, leaving every other picker
+as it is:
+
+```toml
+[editor.file-explorer]
+modal = true              # the explorer is modal; other pickers follow editor.picker.modal
+```
+
+`modal = false` there does the opposite, keeping the explorer non-modal while
+the rest of the pickers are modal.
 
 [the picker keymap]: ./keymap.md#picker
 
