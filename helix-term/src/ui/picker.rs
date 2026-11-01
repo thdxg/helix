@@ -59,7 +59,7 @@ use helix_view::{
 
 use self::handlers::{
     spawn_preview_raster, DynamicQueryChange, DynamicQueryHandler, PreviewHighlightHandler,
-    PreviewMediaHandler,
+    PreviewMediaEvent, PreviewMediaHandler,
 };
 
 pub const ID: &str = "picker";
@@ -436,7 +436,7 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     /// An event handler for syntax highlighting the currently previewed file.
     preview_highlight_handler: Sender<Arc<Path>>,
     /// An event handler for rasterizing the currently previewed image or PDF.
-    preview_media_handler: Sender<(Arc<Path>, Option<(u32, u32)>)>,
+    preview_media_handler: Sender<PreviewMediaEvent>,
     /// Size in pixels of the box a previewed image or PDF page is drawn in, if
     /// the terminal reports its pixel size: PDF pages are rendered to fill it.
     preview_fit_px: Option<(u32, u32)>,

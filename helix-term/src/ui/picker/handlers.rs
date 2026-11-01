@@ -112,12 +112,15 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> AsyncHook
     }
 }
 
+/// A path to rasterize for the preview, and the box in pixels it is drawn in.
+pub(super) type PreviewMediaEvent = (Arc<Path>, Option<(u32, u32)>);
+
 /// Rasterizes the image or PDF under the cursor so the preview can draw it.
 /// Debounced like [`PreviewHighlightHandler`]: scrolling past a directory of
 /// images should not shell out to `magick` for every one of them. A PDF's
 /// page is rendered to fill the pixel box sent along with the path.
 pub(super) struct PreviewMediaHandler<T: 'static + Send + Sync, D: 'static + Send + Sync> {
-    trigger: Option<(Arc<Path>, Option<(u32, u32)>)>,
+    trigger: Option<PreviewMediaEvent>,
     phantom_data: std::marker::PhantomData<(T, D)>,
 }
 
@@ -131,7 +134,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Default for PreviewMedi
 }
 
 impl<T: 'static + Send + Sync, D: 'static + Send + Sync> AsyncHook for PreviewMediaHandler<T, D> {
-    type Event = (Arc<Path>, Option<(u32, u32)>);
+    type Event = PreviewMediaEvent;
 
     fn handle_event(
         &mut self,
