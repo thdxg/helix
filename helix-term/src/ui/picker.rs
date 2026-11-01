@@ -48,7 +48,7 @@ use helix_core::{
     visual_offset_from_anchor, Position,
 };
 use helix_view::{
-    editor::{Action, PickerModeConfig},
+    editor::{Action, Config as EditorConfig, PickerModeConfig},
     graphics::{CursorKind, Margin, Modifier, Rect},
     input::KeyEvent,
     media::{GraphicsMode, MediaKind, MediaState},
@@ -59,7 +59,7 @@ use helix_view::{
 
 use self::handlers::{
     spawn_preview_raster, DynamicQueryChange, DynamicQueryHandler, PreviewHighlightHandler,
-    PreviewMediaHandler,
+    PreviewMediaEvent, PreviewMediaHandler,
 };
 
 pub const ID: &str = "picker";
@@ -426,6 +426,9 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     /// `editor.picker.default-mode` names, unless its creator hands it a
     /// [`PickerModeHandle`] saying otherwise. Read through [`Picker::mode`].
     mode: PickerModeHandle,
+    /// Reads off the configuration whether this picker is modal. Defaults to
+    /// `editor.picker.modal`; see [`Picker::with_modal_config`].
+    modal_config: fn(&EditorConfig) -> bool,
 
     pub truncate_start: bool,
     /// Caches paths to documents
@@ -436,7 +439,7 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     /// An event handler for syntax highlighting the currently previewed file.
     preview_highlight_handler: Sender<Arc<Path>>,
     /// An event handler for rasterizing the currently previewed image or PDF.
-    preview_media_handler: Sender<(Arc<Path>, Option<(u32, u32)>)>,
+    preview_media_handler: Sender<PreviewMediaEvent>,
     /// Size in pixels of the box a previewed image or PDF page is drawn in, if
     /// the terminal reports its pixel size: PDF pages are rendered to fill it.
     preview_fit_px: Option<(u32, u32)>,
@@ -577,6 +580,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             key_handlers: HashMap::new(),
             modal_key_handlers: HashMap::new(),
             mode: PickerModeHandle::default(),
+            modal_config: |config| config.picker.modal,
             completion_height: 0,
             widths,
             preview_cache: HashMap::new(),
@@ -693,6 +697,15 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         self
     }
 
+    /// Decides whether the picker is modal with `modal_config` rather than
+    /// `editor.picker.modal`, for a picker with a setting of its own. It is
+    /// read on every key and every frame, as `editor.picker.modal` is, so
+    /// that `:set` takes effect on a picker that is already open.
+    pub fn with_modal_config(mut self, modal_config: fn(&EditorConfig) -> bool) -> Self {
+        self.modal_config = modal_config;
+        self
+    }
+
     /// Adds extra key bindings to the picker.
     ///
     /// The handlers are consulted before the picker's own key handling and before
@@ -792,14 +805,20 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         })
     }
 
+    /// Whether the picker supports modal editing at all: `editor.picker.modal`,
+    /// unless [`Picker::with_modal_config`] said otherwise.
+    fn is_modal(&self, editor: &Editor) -> bool {
+        (self.modal_config)(&editor.config())
+    }
+
     /// Whether the picker is currently in modal normal mode, where unmodified
     /// keys drive the picker rather than typing into the query.
     ///
-    /// Always `false` while `editor.picker.modal` is disabled, which is the
-    /// default: turning the option off restores exactly the pre-modal
-    /// behaviour, `Esc` closing the picker included.
+    /// Always `false` while the picker is not modal, which is the default:
+    /// turning the option off restores exactly the pre-modal behaviour, `Esc`
+    /// closing the picker included.
     fn in_normal_mode(&self, editor: &Editor) -> bool {
-        editor.config().picker.modal && self.mode(editor) == PickerMode::Normal
+        self.is_modal(editor) && self.mode(editor) == PickerMode::Normal
     }
 
     pub fn with_dynamic_query(
@@ -1270,7 +1289,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         // the statusline's own mode indicator: in the mode's colour only when
         // `editor.color-modes` is set, in the plain statusline style otherwise.
         let config = cx.editor.config();
-        let mode = config.picker.modal.then(|| {
+        let mode = self.is_modal(cx.editor).then(|| {
             let (label, scope) = match self.mode(cx.editor) {
                 PickerMode::Insert => ("INS ", "ui.statusline.insert"),
                 PickerMode::Normal => ("NOR ", "ui.statusline.normal"),
@@ -1893,13 +1912,13 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             return EventResult::Consumed(None);
         }
 
-        // Modal editing, when `editor.picker.modal` is enabled. `Esc` leaves the
-        // query for normal mode instead of closing the picker, and normal mode
-        // binds unmodified keys to the picker's actions. Everything below this
-        // block — `Enter`, the `Ctrl-*` bindings, the arrow keys — keeps working
-        // identically in both modes, and none of it is reached at all while the
-        // option is off.
-        if ctx.editor.config().picker.modal {
+        // Modal editing, when the picker is modal (`editor.picker.modal`, or a
+        // setting of the picker's own). `Esc` leaves the query for normal mode
+        // instead of closing the picker, and normal mode binds unmodified keys
+        // to the picker's actions. Everything below this block — `Enter`, the
+        // `Ctrl-*` bindings, the arrow keys — keeps working identically in both
+        // modes, and none of it is reached at all while the option is off.
+        if self.is_modal(ctx.editor) {
             // A terminal speaking the Kitty keyboard protocol reports `G` as
             // `Shift-G`; fold that back so both spellings hit the same binding.
             let mut key_event = key_event;
@@ -2106,7 +2125,7 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
         };
         // Keep in step with `render_picker`: a modal picker reserves room for
         // the mode indicator at the head of the prompt line.
-        let mode_width = if editor.config().picker.modal { 4 } else { 0 };
+        let mode_width = if self.is_modal(editor) { 4 } else { 0 };
         let area = inner
             .clip_left(1)
             .with_height(1)
@@ -2277,6 +2296,19 @@ mod modal_test {
         let picker = test_picker().with_mode_handle(PickerModeHandle::new(PickerMode::Normal));
 
         assert_eq!(picker.mode.get(), Some(PickerMode::Normal));
+    }
+
+    #[tokio::test]
+    async fn a_picker_is_modal_per_editor_picker_modal_unless_told_otherwise() {
+        let mut config = EditorConfig::default();
+        let picker = test_picker();
+        let explorer_like = test_picker().with_modal_config(|config| !config.picker.modal);
+
+        for modal in [false, true] {
+            config.picker.modal = modal;
+            assert_eq!((picker.modal_config)(&config), modal);
+            assert_eq!((explorer_like.modal_config)(&config), !modal);
+        }
     }
 
     #[tokio::test]

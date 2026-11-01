@@ -1039,7 +1039,10 @@ mod tests {
         // The test raster is 1000x1000 px at 72 DPI: a 1000x1000 pt page.
         let mut state = pdf_state(Some(10));
         state.fit_to(Some((1000, 1000)));
-        assert!(state.take_raster_request().is_none(), "already sharp enough");
+        assert!(
+            state.take_raster_request().is_none(),
+            "already sharp enough"
+        );
 
         // The view grows: the same page is rendered again, sharper.
         state.fit_to(Some((2000, 1500)));
