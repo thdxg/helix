@@ -1271,16 +1271,28 @@ mod test {
         }
     }
 
+    /// `path` as the watcher would report it. Canonical paths carry the verbatim
+    /// prefix on Windows; without it `CanonicalPathBuf` prepends a separator, and
+    /// `\/home` would parse as a UNC prefix rather than a root directory.
+    fn canonical(path: &str) -> std::path::PathBuf {
+        if cfg!(windows) {
+            std::path::PathBuf::from(format!(r"\\?\C:{}", path.replace('/', r"\")))
+        } else {
+            std::path::PathBuf::from(path)
+        }
+    }
+
     fn fs_event(path: &str, ty: EventType) -> Event {
         Event {
-            path: CanonicalPathBuf::assert_canonicalized(Path::new(path)),
+            path: CanonicalPathBuf::assert_canonicalized(&canonical(path)),
             ty,
         }
     }
 
     #[test]
     fn test_affects_listing() {
-        let root = Path::new("/home/user/project");
+        let root = canonical("/home/user/project");
+        let root = root.as_path();
 
         // A row of the listing appearing or going away.
         for ty in [EventType::Create, EventType::Delete] {

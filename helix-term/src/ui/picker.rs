@@ -69,7 +69,7 @@ pub const ID: &str = "picker";
 /// mode is only ever consulted for a modal picker.
 ///
 /// Deliberately not [`Default`]: which mode a picker opens in is the
-/// configuration's to say. See [`Picker::mode`].
+/// configuration's to say. See `Picker::mode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerMode {
     /// Keys type into the query, as they always do in a non-modal picker.
@@ -207,7 +207,7 @@ pub enum CachedPreview {
 
 /// An image or the first page of a PDF. Rasterizing runs off the main thread
 /// (it shells out to `magick`/`pdftoppm`), so the preview starts out pending
-/// and is filled in by [`handlers::PreviewMediaHandler`].
+/// and is filled in by `handlers::PreviewMediaHandler`.
 pub enum MediaPreview {
     /// Not rasterized yet. `started` guards against kicking off a second
     /// rasterize for a page that is already being worked on.

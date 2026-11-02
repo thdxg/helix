@@ -125,7 +125,7 @@ impl Watcher {
 
     pub fn reload(&mut self, config: &Config) {
         let old_config = replace(&mut self.config, config.clone());
-        let (workspace, no_workspace) = helix_loader::find_workspace();
+        let (workspace, no_workspace) = canonical_workspace();
 
         if !config.enable || config.require_workspace && no_workspace {
             self.watcher = None;
@@ -216,7 +216,7 @@ impl Watcher {
     }
 
     fn is_watching_canonical(&self, path: &Path) -> bool {
-        let (workspace, _) = helix_loader::find_workspace();
+        let (workspace, _) = canonical_workspace();
         // Check if under workspace and not filtered
         if path.starts_with(&workspace) && !self.filter.ignore_path_rec(path, Some(false)) {
             return true;
@@ -259,7 +259,7 @@ impl Watcher {
     /// named `.git`, as with submodules) is polled. Call again whenever `HEAD` moves to
     /// another branch: the branch ref is one of the files.
     pub fn set_vcs_paths(&mut self, paths: Vec<PathBuf>) {
-        let (workspace, _) = helix_loader::find_workspace();
+        let (workspace, _) = canonical_workspace();
         for path in &paths {
             let Some(git_dir) = path.ancestors().find(|it| it.ends_with(".git")) else {
                 continue;
@@ -330,7 +330,7 @@ impl Watcher {
         {
             return;
         }
-        let (workspace, _) = helix_loader::find_workspace();
+        let (workspace, _) = canonical_workspace();
         if root.starts_with(&workspace) {
             return;
         }
@@ -347,6 +347,16 @@ impl Watcher {
             }
         }
     }
+}
+
+/// The workspace root as the watcher sees paths: canonical. filesentry hands the filter
+/// canonical paths and the ignore rules are anchored at the root they strip off, so a
+/// root that differs only in form -- on Windows the working directory lacks the `\\?\`
+/// prefix a canonical path carries, on Unix it may be reached through a symlink -- puts
+/// every path outside the root, and nothing in the workspace is ignored.
+fn canonical_workspace() -> (PathBuf, bool) {
+    let (workspace, no_workspace) = helix_loader::find_workspace();
+    (workspace.canonicalize().unwrap_or(workspace), no_workspace)
 }
 
 fn build_ignore(paths: impl IntoIterator<Item = PathBuf> + Clone, dir: &Path) -> Option<Gitignore> {
@@ -695,8 +705,8 @@ mod tests {
     use ignore::gitignore::Gitignore;
 
     use crate::file_watcher::{
-        is_git_head_state, is_hardcoded_whitelist, is_hidden, is_vcs_ignore, IgnoreFiles,
-        WatchFilter,
+        is_git_head_state, is_hardcoded_whitelist, is_hidden, is_vcs_ignore, Config, Filter,
+        IgnoreFiles, WatchFilter,
     };
 
     fn filter(roots: &[&str]) -> WatchFilter {
@@ -715,6 +725,21 @@ mod tests {
             hidden: true,
             watch_vcs: true,
         }
+    }
+
+    /// The ignore rules are anchored at the root they are built for, and filesentry
+    /// hands the filter canonical paths, so the filter has to be built from the
+    /// canonical workspace root (see `canonical_workspace`): with a root that differs
+    /// only in form the workspace's own `.gitignore` never applies.
+    #[test]
+    fn ignore_rules_apply_to_canonical_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::create_dir(dir.path().join("ignored")).unwrap();
+        let workspace = dir.path().canonicalize().unwrap();
+        let filter = WatchFilter::new(&Config::default(), &workspace, std::iter::empty());
+        assert!(filter.ignore_path_rec(&workspace.join("ignored/file.rs"), Some(false)));
+        assert!(!filter.ignore_path_rec(&workspace.join("src/file.rs"), Some(false)));
     }
 
     /// A path must resolve to the watch root that actually contains it. With
