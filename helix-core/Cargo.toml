@@ -67,4 +67,5 @@ filesentry = { git = "https://github.com/helix-editor/filesentry", rev = "9d594d
 
 [dev-dependencies]
 quickcheck.workspace = true
+tempfile.workspace = true
 indoc = "2.0.6"

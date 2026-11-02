@@ -188,24 +188,35 @@ impl DiffProvider {
 mod tests {
     use super::*;
 
+    /// `path` as the watcher would report it: canonical Windows paths carry the
+    /// verbatim prefix, and `CanonicalPathBuf` prepends a separator to anything
+    /// else, which turns `/repo/.git` into a UNC path.
+    #[cfg(feature = "git")]
+    fn canonical(path: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!(r"\\?\C:{}", path.replace('/', r"\")))
+        } else {
+            PathBuf::from(path)
+        }
+    }
+
     #[cfg(feature = "git")]
     #[test]
     fn test_needs_reload_regular_git() {
         use helix_core::file_watcher::{CanonicalPathBuf, Event, EventType};
-        use std::path::Path;
 
         let provider = DiffProvider::Git;
 
         // Regular .git/HEAD should trigger reload
         let event = Event {
-            path: CanonicalPathBuf::assert_canonicalized(Path::new("/home/user/repo/.git/HEAD")),
+            path: CanonicalPathBuf::assert_canonicalized(&canonical("/home/user/repo/.git/HEAD")),
             ty: EventType::Modified,
         };
         assert!(provider.needs_reload(&event));
 
         // Other .git files should not trigger reload
         let event = Event {
-            path: CanonicalPathBuf::assert_canonicalized(Path::new("/home/user/repo/.git/config")),
+            path: CanonicalPathBuf::assert_canonicalized(&canonical("/home/user/repo/.git/config")),
             ty: EventType::Modified,
         };
         assert!(!provider.needs_reload(&event));
@@ -216,11 +227,10 @@ mod tests {
     #[test]
     fn test_needs_reload_branch_refs() {
         use helix_core::file_watcher::{CanonicalPathBuf, Event, EventType};
-        use std::path::Path;
 
         let provider = DiffProvider::Git;
         let event = |path: &str, ty| Event {
-            path: CanonicalPathBuf::assert_canonicalized(Path::new(path)),
+            path: CanonicalPathBuf::assert_canonicalized(&canonical(path)),
             ty,
         };
 
@@ -255,13 +265,12 @@ mod tests {
     #[test]
     fn test_needs_reload_worktree_head() {
         use helix_core::file_watcher::{CanonicalPathBuf, Event, EventType};
-        use std::path::Path;
 
         let provider = DiffProvider::Git;
 
         // Worktree HEAD at .git/worktrees/<name>/HEAD should trigger reload
         let event = Event {
-            path: CanonicalPathBuf::assert_canonicalized(Path::new(
+            path: CanonicalPathBuf::assert_canonicalized(&canonical(
                 "/home/user/main-repo/.git/worktrees/my-worktree/HEAD",
             )),
             ty: EventType::Modified,
@@ -270,7 +279,7 @@ mod tests {
 
         // Nested worktree name should also work
         let event = Event {
-            path: CanonicalPathBuf::assert_canonicalized(Path::new(
+            path: CanonicalPathBuf::assert_canonicalized(&canonical(
                 "/home/user/main-repo/.git/worktrees/feature-branch/HEAD",
             )),
             ty: EventType::Modified,
@@ -279,7 +288,7 @@ mod tests {
 
         // Non-HEAD files in worktrees should not trigger reload
         let event = Event {
-            path: CanonicalPathBuf::assert_canonicalized(Path::new(
+            path: CanonicalPathBuf::assert_canonicalized(&canonical(
                 "/home/user/main-repo/.git/worktrees/my-worktree/index",
             )),
             ty: EventType::Modified,
@@ -288,7 +297,7 @@ mod tests {
 
         // HEAD files not in .git/worktrees should not trigger reload
         let event = Event {
-            path: CanonicalPathBuf::assert_canonicalized(Path::new(
+            path: CanonicalPathBuf::assert_canonicalized(&canonical(
                 "/home/user/other/worktrees/my-worktree/HEAD",
             )),
             ty: EventType::Modified,
