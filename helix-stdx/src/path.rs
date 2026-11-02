@@ -338,11 +338,21 @@ pub fn copy_all(from: &Path, to: &Path) -> std::io::Result<()> {
 /// that a symlink pointing at a directory is unlinked instead of being followed
 /// into the directory it names, which would delete the target's contents.
 pub fn remove_all(path: &Path) -> std::io::Result<()> {
-    if fs::symlink_metadata(path)?.is_dir() {
-        fs::remove_dir_all(path)
-    } else {
-        fs::remove_file(path)
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_dir() {
+        return fs::remove_dir_all(path);
     }
+    // On Windows a symlink to a directory is itself a directory entry: it is
+    // unlinked with `remove_dir`, which does not follow it, and `remove_file`
+    // refuses it.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        if metadata.file_type().is_symlink_dir() {
+            return fs::remove_dir(path);
+        }
+    }
+    fs::remove_file(path)
 }
 
 #[cfg(test)]
