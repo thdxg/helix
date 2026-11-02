@@ -443,6 +443,10 @@ pub struct Config {
     pub editor_config: bool,
     /// Whether to render rainbow colors for matching brackets. Defaults to `false`.
     pub rainbow_brackets: bool,
+    /// Whether to hide markup, such as the `**` around bold markdown, in languages that ship
+    /// a `conceal.scm` query. Lines holding a cursor or selection show the markup. Defaults
+    /// to `true`.
+    pub conceal: bool,
     /// Whether to enable Kitty Keyboard Protocol
     pub kitty_keyboard_protocol: KittyKeyboardProtocolConfig,
     /// Graphical rendering of images/PDFs (kitty graphics protocol).
@@ -1382,6 +1386,7 @@ impl Default for Config {
             clipboard_provider: ClipboardProvider::default(),
             editor_config: true,
             rainbow_brackets: false,
+            conceal: true,
             kitty_keyboard_protocol: Default::default(),
             image_rendering: Default::default(),
             buffer_picker: BufferPickerConfig::default(),

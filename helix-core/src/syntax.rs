@@ -28,7 +28,7 @@ use tree_house::{
     Error, InjectionLanguageMarker, LanguageConfig as SyntaxConfig, Layer,
 };
 
-use crate::{indent::IndentQuery, tree_sitter, ChangeSet, Language};
+use crate::{indent::IndentQuery, tree_sitter, ChangeSet, Language, Tendril};
 
 pub use tree_house::{
     highlighter::{Highlight, HighlightEvent},
@@ -45,6 +45,7 @@ pub struct LanguageData {
     fold_query: OnceCell<Option<FoldQuery>>,
     tag_query: OnceCell<Option<TagQuery>>,
     rainbow_query: OnceCell<Option<RainbowQuery>>,
+    conceal_query: OnceCell<Option<ConcealQuery>>,
 }
 
 impl Clone for LanguageData {
@@ -57,6 +58,7 @@ impl Clone for LanguageData {
             fold_query: OnceCell::new(),
             tag_query: OnceCell::new(),
             rainbow_query: OnceCell::new(),
+            conceal_query: OnceCell::new(),
         }
     }
 }
@@ -71,6 +73,7 @@ impl LanguageData {
             fold_query: OnceCell::new(),
             tag_query: OnceCell::new(),
             rainbow_query: OnceCell::new(),
+            conceal_query: OnceCell::new(),
         }
     }
 
@@ -205,6 +208,36 @@ impl LanguageData {
                         log::error!("{err}");
                     })
                     .ok()
+            })
+            .as_ref()
+    }
+
+    /// Compiles the conceal.scm query for a language, if it ships one (see [`ConcealQuery`]).
+    /// This function should only be used by this module or the xtask crate.
+    pub fn compile_conceal_query(
+        grammar: Grammar,
+        config: &LanguageConfiguration,
+    ) -> Result<Option<ConcealQuery>> {
+        let name = &config.language_id;
+        let text = read_query(name, "conceal.scm");
+        if text.is_empty() {
+            return Ok(None);
+        }
+        ConcealQuery::new(grammar, &text)
+            .map(Some)
+            .with_context(|| format!("Failed to compile conceal.scm query for '{name}'"))
+    }
+
+    fn conceal_query(&self, loader: &Loader) -> Option<&ConcealQuery> {
+        self.conceal_query
+            .get_or_init(|| {
+                let grammar = self.syntax_config(loader)?.grammar;
+                Self::compile_conceal_query(grammar, &self.config)
+                    .map_err(|err| {
+                        log::error!("{err}");
+                    })
+                    .ok()
+                    .flatten()
             })
             .as_ref()
     }
@@ -523,6 +556,10 @@ impl Loader {
 
     pub fn fold_query(&self, lang: Language) -> Option<&FoldQuery> {
         self.language(lang).fold_query(self)
+    }
+
+    pub fn conceal_query(&self, lang: Language) -> Option<&ConcealQuery> {
+        self.language(lang).conceal_query(self)
     }
 
     pub fn tag_query(&self, lang: Language) -> Option<&TagQuery> {
@@ -1311,6 +1348,87 @@ impl FoldQuery {
     /// Whether a match of this query marks a foldable node.
     pub fn is_fold(&self, capture: Capture) -> bool {
         self.fold_capture.is_none_or(|fold| fold == capture)
+    }
+}
+
+/// The query that decides which markup a language hides when `editor.conceal` is on (see
+/// [`crate::conceal`]).
+///
+/// A `conceal.scm` marks the hidden nodes with `@conceal`. Pattern properties refine a
+/// pattern:
+///
+/// * `(#set! conceal "•")` displays the given text in place of the hidden one.
+/// * `(#set! conceal.trim-whitespace)` keeps the whitespace at either end of the node
+///   visible, for tokens such as list markers that include the space after them.
+/// * `(#set! conceal.trailing-whitespace)` hides the spaces and tabs after the node too,
+///   for markers such as `#` whose following space is not part of any node.
+#[derive(Debug)]
+pub struct ConcealQuery {
+    pub query: Query,
+    conceal_capture: Option<Capture>,
+    replacements: foldhash::HashMap<Pattern, Tendril>,
+    trim_whitespace: HashSet<Pattern>,
+    trailing_whitespace: HashSet<Pattern>,
+}
+
+impl ConcealQuery {
+    fn new(grammar: Grammar, source: &str) -> Result<Self, tree_sitter::query::ParseError> {
+        let mut replacements = foldhash::HashMap::default();
+        let mut trim_whitespace = HashSet::default();
+        let mut trailing_whitespace = HashSet::default();
+
+        let query = Query::new(grammar, source, |pattern, predicate| match predicate {
+            UserPredicate::SetProperty {
+                key: "conceal",
+                val,
+            } => {
+                replacements.insert(pattern, Tendril::from(val.unwrap_or("")));
+                Ok(())
+            }
+            UserPredicate::SetProperty {
+                key: "conceal.trim-whitespace",
+                val: None,
+            } => {
+                trim_whitespace.insert(pattern);
+                Ok(())
+            }
+            UserPredicate::SetProperty {
+                key: "conceal.trailing-whitespace",
+                val: None,
+            } => {
+                trailing_whitespace.insert(pattern);
+                Ok(())
+            }
+            _ => Err(InvalidPredicateError::unknown(predicate)),
+        })?;
+
+        Ok(Self {
+            conceal_capture: query.get_capture("conceal"),
+            query,
+            replacements,
+            trim_whitespace,
+            trailing_whitespace,
+        })
+    }
+
+    /// Whether a match of this query marks hidden text.
+    pub fn is_conceal(&self, capture: Capture) -> bool {
+        self.conceal_capture == Some(capture)
+    }
+
+    /// The text displayed in place of the hidden text of `pattern`, empty for none.
+    pub fn replacement(&self, pattern: Pattern) -> &str {
+        self.replacements
+            .get(&pattern)
+            .map_or("", |replacement| replacement.as_str())
+    }
+
+    pub fn trims_whitespace(&self, pattern: Pattern) -> bool {
+        self.trim_whitespace.contains(&pattern)
+    }
+
+    pub fn hides_trailing_whitespace(&self, pattern: Pattern) -> bool {
+        self.trailing_whitespace.contains(&pattern)
     }
 }
 
