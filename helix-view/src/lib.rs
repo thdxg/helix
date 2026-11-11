@@ -12,6 +12,7 @@ pub mod graphics;
 pub mod gutter;
 pub mod handlers;
 pub mod info;
+pub mod inline_image;
 pub mod input;
 pub mod keyboard;
 pub mod media;

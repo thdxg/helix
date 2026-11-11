@@ -71,6 +71,7 @@
 | `clipboard-provider` | Which API to use for clipboard interaction. One of `pasteboard` (MacOS), `wayland`, `x-clip`, `x-sel`, `win32-yank`, `termux`, `tmux`, `windows`, `termcode`, `none`, or a custom command set. | Platform and environment specific. |
 | `editor-config` | Whether to read settings from [EditorConfig](https://editorconfig.org) files | `true` |
 | `rainbow-brackets` | Whether to render rainbow colors for matching brackets. Requires tree-sitter `rainbows.scm` queries for the language. | `false` |
+| `markdown-preview` | Whether markdown reads like a rendered preview: markup such as the `**` around bold text or the `#` of a heading is hidden, tables are lined up and drawn with box lines (following each column's `:---:` alignment), and local images are drawn below the line that references them when the terminal supports the kitty graphics protocol (see `image-rendering`). Lines holding a cursor or selection show their markup. Also applies to the picker and file explorer previews. Toggle with `:toggle markdown-preview`. Works for languages that ship a tree-sitter `conceal.scm` query (markdown). | `true` |
 | `kitty-keyboard-protocol` | Whether to enable Kitty Keyboard Protocol. Can be `enabled`, `disabled` or `auto` | `"auto"` |
 | `image-rendering` | Graphical rendering of images/PDFs via the kitty graphics protocol. Can be `auto` (detect kitty/ghostty terminals), `kitty` (force) or `disabled` | `"auto"` |
 
@@ -627,21 +628,3 @@ level = "servers"
 # under a matching path. `~` and environment variables are expanded.
 trusted = ["~/src/github.com/me/*"]
 ```
-
-### `[editor.conceal]` Section
-
-Hides markup, such as the `**` around bold text or the `#` of a heading, per language. Only
-languages that ship a tree-sitter `conceal.scm` query (markdown) can hide anything. Lines holding
-a cursor or selection show the markup. While markdown is concealed, the columns of its tables are
-lined up and drawn with box lines, following the `:---:` alignment of each column.
-
-Each key is a language name and its value whether that language is concealed. A language that is
-not listed is not concealed.
-
-```toml
-[editor.conceal]
-markdown = true
-```
-
-`conceal = true` and `conceal = false` are accepted as well: `true` is the default table above,
-`false` turns concealing off for every language. Toggle a language with `:toggle conceal.markdown`.

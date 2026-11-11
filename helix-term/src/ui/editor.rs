@@ -165,6 +165,8 @@ impl EditorView {
         let doc = cx.editor.document(doc_id).unwrap();
         let view = cx.editor.tree.get(view_id);
         let view_area = view.area;
+        // The images drawn into the view (`markdown-preview`), to transmit after drawing.
+        let mut drawn_images = Vec::new();
         if doc.media.is_some() {
             self.rendered_views.remove(&view_id);
             Self::render_media_view(doc_id, view_id, viewport, surface, cx);
@@ -200,6 +202,7 @@ impl EditorView {
             }
             self.rendered_views.insert(view_id, rendered);
 
+            let drawn = std::cell::RefCell::new(Vec::new());
             let mut decorations = DecorationManager::default();
 
             if is_focused && config.cursorline {
@@ -318,6 +321,13 @@ impl EditorView {
                 inline_diagnostic_config,
                 config.end_of_line_diagnostics,
             ));
+            // Last, as the rows it draws in are reserved last, see `View::text_annotations`.
+            let images = doc.conceal_images(view.id);
+            if !images.is_empty() {
+                let blocks =
+                    helix_view::inline_image::layout(images, width, view.inner_height() as u16);
+                decorations.add_decoration(text_decorations::InlineImages::new(blocks, &drawn));
+            }
             render_document(
                 surface,
                 inner,
@@ -329,6 +339,7 @@ impl EditorView {
                 theme,
                 decorations,
             );
+            drawn_images = drawn.into_inner();
 
             // if we're not at the edge of the screen, draw a right border
             if viewport.right() != view.area.right() {
@@ -347,6 +358,12 @@ impl EditorView {
             {
                 Self::render_diagnostics(doc, view, inner, surface, theme);
             }
+        }
+
+        for image in drawn_images {
+            cx.editor
+                .graphics
+                .ensure_placement(&image.raster, image.cols, image.rows);
         }
 
         let statusline_area = view_area

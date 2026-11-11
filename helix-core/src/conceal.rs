@@ -1,7 +1,7 @@
 //! Hiding markup ("conceal").
 //!
 //! Markup languages such as markdown spell their formatting out in the text: `**bold**`,
-//! `# Heading`, `[text](url)`. With `editor.conceal` on, the markers are hidden while the
+//! `# Heading`, `[text](url)`. With `editor.markdown-preview` on, the markers are hidden while the
 //! text they mark keeps its highlight, so a document reads like a rendered preview. Lines
 //! that hold a cursor (or any part of a selection) are shown as they are in the file, so the
 //! source is always visible where it is being edited, and the rest of the document is
@@ -41,13 +41,54 @@ pub fn conceal_ranges(
     lines: Range<usize>,
     revealed: impl Fn(usize) -> bool,
 ) -> Vec<Conceal> {
+    conceal(syntax, text, loader, lines, revealed).conceals
+}
+
+/// An image referenced by the document (`@conceal.image`), such as markdown's
+/// `![alt](path)`: drawn below its line while the document is concealed, whether or not its
+/// line is revealed, so the text below does not jump as the cursor passes over it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConcealImage {
+    /// The document line the image is drawn below.
+    pub line: usize,
+    /// Where the path starts (a char index); images on one line are drawn in this order.
+    pub start: usize,
+    /// The path as written in the document.
+    pub path: String,
+}
+
+/// What [`conceal`] hides and draws.
+#[derive(Debug, Default)]
+pub struct Concealed {
+    /// See [`conceal_ranges`].
+    pub conceals: Vec<Conceal>,
+    /// The images on the lines, in document order.
+    pub images: Vec<ConcealImage>,
+}
+
+/// [`conceal_ranges`], along with the images (`@conceal.image`) on the lines.
+pub fn conceal(
+    syntax: &Syntax,
+    text: RopeSlice,
+    loader: &Loader,
+    lines: Range<usize>,
+    revealed: impl Fn(usize) -> bool,
+) -> Concealed {
     let len_lines = text.len_lines();
     let lines = lines.start.min(len_lines)..lines.end.min(len_lines);
     if lines.is_empty() {
-        return Vec::new();
+        return Concealed::default();
     }
 
-    let (mut conceals, tables) = query_conceals(syntax, text, loader, lines.clone(), &revealed);
+    let mut images = Vec::new();
+    let (mut conceals, tables) = query_conceals(
+        syntax,
+        text,
+        loader,
+        lines.clone(),
+        &revealed,
+        Some(&mut images),
+    );
     let mut table_extra = Vec::new();
     for table in tables {
         table_conceals(
@@ -63,7 +104,9 @@ pub fn conceal_ranges(
     }
     conceals.extend(table_extra);
     sort_and_dedup(&mut conceals);
-    conceals
+    images.sort_unstable_by_key(|image| image.start);
+    images.dedup_by_key(|image| image.start);
+    Concealed { conceals, images }
 }
 
 /// Runs the conceal query over `lines`: the hidden ranges, sorted and non-overlapping, and
@@ -74,6 +117,7 @@ fn query_conceals<'tree>(
     loader: &'tree Loader,
     lines: Range<usize>,
     revealed: &dyn Fn(usize) -> bool,
+    mut images: Option<&mut Vec<ConcealImage>>,
 ) -> (Vec<Conceal>, Vec<Node<'tree>>) {
     let len_lines = text.len_lines();
     let start_byte = text.line_to_byte(lines.start) as u32;
@@ -100,6 +144,18 @@ fn query_conceals<'tree>(
         if query.is_table(mat.capture) {
             if !tables.contains(&mat.node) {
                 tables.push(mat.node.clone());
+            }
+            continue;
+        }
+        if query.is_image(mat.capture) {
+            if let Some(images) = images.as_deref_mut() {
+                let start = text.byte_to_char(mat.node.start_byte() as usize);
+                let end = text.byte_to_char(mat.node.end_byte() as usize);
+                images.push(ConcealImage {
+                    line: text.char_to_line(start),
+                    start,
+                    path: text.slice(start..end).to_string(),
+                });
             }
             continue;
         }
@@ -311,8 +367,14 @@ fn table_conceals(
     // columns stay put when the cursor moves through the table.
     let first_line = rows.first().map_or(0, |row| row.line);
     let last_line = rows.last().map_or(0, |row| row.line);
-    let (table_conceals, _) =
-        query_conceals(syntax, text, loader, first_line..last_line + 1, &|_| false);
+    let (table_conceals, _) = query_conceals(
+        syntax,
+        text,
+        loader,
+        first_line..last_line + 1,
+        &|_| false,
+        None,
+    );
     let mut widths: Vec<usize> = Vec::new();
     let mut cell_widths: Vec<Vec<usize>> = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -590,6 +652,30 @@ mod test {
         assert_eq!(
             rendered(src, &[2]),
             "│ a    │ b │\n├──────┼───┤\n| **long** | c |\n"
+        );
+    }
+
+    #[test]
+    fn images_are_found_on_revealed_lines_too() {
+        let src = "Text ![one](a.png) and ![two](<b c.png>)\n\n![three](https://x.y/c.png)\n";
+        let text = Rope::from(src);
+        let language = LOADER.language_for_name("markdown").unwrap();
+        let syntax = Syntax::new(text.slice(..), language, &LOADER).unwrap();
+        let concealed = conceal(
+            &syntax,
+            text.slice(..),
+            &LOADER,
+            0..text.len_lines(),
+            |line| line == 0,
+        );
+        let images: Vec<_> = concealed
+            .images
+            .iter()
+            .map(|image| (image.line, image.path.as_str()))
+            .collect();
+        assert_eq!(
+            images,
+            [(0, "a.png"), (0, "<b c.png>"), (2, "https://x.y/c.png")]
         );
     }
 }

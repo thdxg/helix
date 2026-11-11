@@ -257,6 +257,12 @@ impl Application {
         ])
         .context("build signal handler")?;
 
+        // Last, so the startup status (e.g. "Loaded 1 file.") does not hide it.
+        let deprecations = &config.load().deprecations;
+        if !deprecations.is_empty() {
+            editor.set_warning(deprecations.join("; "));
+        }
+
         let app = Self {
             compositor,
             terminal,
@@ -334,6 +340,14 @@ impl Application {
 
         // Refresh pixel metrics so media placements scale correctly.
         cx.editor.graphics.window_px = self.terminal.window_pixel_size();
+        // Documents lay out the images they draw (`markdown-preview`) from these.
+        helix_view::media::set_graphics_metrics(
+            (cx.editor.graphics.mode == helix_view::media::GraphicsMode::Kitty).then(|| {
+                helix_view::media::GraphicsMetrics {
+                    cell_px: cx.editor.graphics.cell_px(area.width, area.height),
+                }
+            }),
+        );
 
         let surface = self.terminal.current_buffer_mut();
 
@@ -557,7 +571,13 @@ impl Application {
 
         match refresh_config() {
             Ok(_) => {
-                self.editor.set_status("Config refreshed");
+                let deprecations = &self.config.load().deprecations;
+                if deprecations.is_empty() {
+                    self.editor.set_status("Config refreshed");
+                } else {
+                    self.editor
+                        .set_warning(format!("Config refreshed; {}", deprecations.join("; ")));
+                }
             }
             Err(err) => {
                 self.editor.set_error(err.to_string());

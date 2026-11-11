@@ -143,6 +143,8 @@ struct ConcealCache {
     /// The document lines (end exclusive) the conceals were computed for, sorted.
     windows: Vec<std::ops::Range<usize>>,
     conceals: Vec<Conceal>,
+    /// The images drawn below their lines, see [`crate::inline_image`].
+    images: Vec<crate::inline_image::ImageRef>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -178,7 +180,7 @@ pub struct Document {
     /// Cache of `fold_spans()`. Computing it walks the whole syntax tree, so it is invalidated
     /// (see `apply_impl`) rather than recomputed on every fold command.
     fold_spans_cache: Option<Vec<FoldSpan>>,
-    /// The hidden markup (`editor.conceal`) of the document, per view: what is hidden depends
+    /// The hidden markup (`editor.markdown-preview`) of the document, per view: what is hidden depends
     /// on the view's selection and scroll position. See [`Document::update_conceals`].
     conceals: HashMap<ViewId, ConcealCache>,
     /// Set to `true` when the document is updated, reset to `false` on the next inlay hints
@@ -1525,7 +1527,7 @@ impl Document {
             .map_or(&[], |cache| cache.conceals.as_slice())
     }
 
-    /// Brings the hidden markup (`editor.conceal`) of `view` up to date, if the document, the
+    /// Brings the hidden markup (`editor.markdown-preview`) of `view` up to date, if the document, the
     /// view's selection or the lines it shows changed since the last time.
     ///
     /// Lines that hold any part of the view's selection are shown as they are in the file,
@@ -1534,9 +1536,7 @@ impl Document {
     /// it scrolls into view. The result feeds [`View::text_annotations`], so this runs before
     /// the view is scrolled or drawn, see [`View::ensure_cursor_in_view`].
     pub fn update_conceals(&mut self, view: &View) {
-        let enabled = self
-            .language_name()
-            .is_some_and(|language| self.config.load().conceal.enabled(language));
+        let enabled = self.config.load().markdown_preview;
         let (Some(syntax), Some(selection), true) =
             (self.syntax.as_ref(), self.selections.get(&view.id), enabled)
         else {
@@ -1585,15 +1585,15 @@ impl Document {
             .collect();
         let loader = self.syn_loader.load();
         let mut conceals = Vec::new();
+        let mut images = Vec::new();
         for window in &windows {
-            conceals.extend(conceal::conceal_ranges(
-                syntax,
-                text,
-                &loader,
-                window.clone(),
-                |line| revealed.iter().any(|lines| lines.contains(&line)),
-            ));
+            let concealed = conceal::conceal(syntax, text, &loader, window.clone(), |line| {
+                revealed.iter().any(|lines| lines.contains(&line))
+            });
+            conceals.extend(concealed.conceals);
+            images.extend(concealed.images);
         }
+        let images = crate::inline_image::resolve(text, self.path(), &images);
         self.conceals.insert(
             view.id,
             ConcealCache {
@@ -1601,8 +1601,17 @@ impl Document {
                 selection: selection.clone(),
                 windows,
                 conceals,
+                images,
             },
         );
+    }
+
+    /// The images `view_id` draws below their lines, in document order. See
+    /// [`Self::update_conceals`] and [`crate::inline_image`].
+    pub fn conceal_images(&self, view_id: ViewId) -> &[crate::inline_image::ImageRef] {
+        self.conceals
+            .get(&view_id)
+            .map_or(&[], |cache| cache.images.as_slice())
     }
 
     /// Computes the regions of the document that can be folded.
