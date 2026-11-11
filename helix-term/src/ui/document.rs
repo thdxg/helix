@@ -91,6 +91,10 @@ pub fn render_text(
     let mut is_in_indent_area = true;
     let mut last_line_indent_level = 0;
     let mut reached_view_top = false;
+    let mut last_grapheme_style = GraphemeStyle {
+        syntax_style: renderer.text_style,
+        overlay_style: Style::default(),
+    };
 
     loop {
         let Some(mut grapheme) = formatter.next() else {
@@ -140,21 +144,26 @@ pub fn render_text(
             overlay_highlighter.advance();
         }
 
-        let grapheme_style = if let GraphemeSource::VirtualText { highlight } = grapheme.source {
-            let mut style = renderer.text_style;
-            if let Some(highlight) = highlight {
-                style = style.patch(theme.highlight(highlight));
+        let grapheme_style = match grapheme.source {
+            GraphemeSource::VirtualText { highlight } => {
+                let mut style = renderer.text_style;
+                if let Some(highlight) = highlight {
+                    style = style.patch(theme.highlight(highlight));
+                }
+                GraphemeStyle {
+                    syntax_style: style,
+                    overlay_style: Style::default(),
+                }
             }
-            GraphemeStyle {
-                syntax_style: style,
-                overlay_style: Style::default(),
-            }
-        } else {
-            GraphemeStyle {
+            // The rest of a conceal replacement follows its first grapheme, which has the
+            // style of the hidden text.
+            GraphemeSource::ConcealReplacement { .. } => last_grapheme_style,
+            GraphemeSource::Document { .. } => GraphemeStyle {
                 syntax_style: syntax_highlighter.style,
                 overlay_style: overlay_highlighter.style,
-            }
+            },
         };
+        last_grapheme_style = grapheme_style;
         decorations.decorate_grapheme(renderer, &grapheme);
 
         let virt = grapheme.is_virtual();
@@ -193,6 +202,7 @@ pub struct TextRenderer<'a> {
     pub offset: Position,
 }
 
+#[derive(Clone, Copy)]
 pub struct GraphemeStyle {
     syntax_style: Style,
     overlay_style: Style,
