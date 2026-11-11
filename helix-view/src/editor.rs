@@ -447,7 +447,6 @@ pub struct Config {
     /// text is hidden, tables are lined up and images are drawn below their lines. Lines
     /// holding a cursor or selection show their markup. Works for languages that ship a
     /// `conceal.scm` query. Defaults to `true`.
-    /// The deprecated `editor.conceal` is read into this, see `helix_term::config`.
     pub markdown_preview: bool,
     /// Whether to enable Kitty Keyboard Protocol
     pub kitty_keyboard_protocol: KittyKeyboardProtocolConfig,

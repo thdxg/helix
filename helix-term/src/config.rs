@@ -14,9 +14,6 @@ pub struct Config {
     pub theme: Option<theme::Config>,
     pub keys: HashMap<Mode, KeyTrie>,
     pub editor: helix_view::editor::Config,
-    /// Deprecated options the config uses, as messages to show the user. The options are
-    /// read into the ones that replace them, see [`migrate_deprecated`].
-    pub deprecations: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -33,34 +30,6 @@ impl Default for Config {
             theme: None,
             keys: keymap::default(),
             editor: helix_view::editor::Config::default(),
-            deprecations: Vec::new(),
-        }
-    }
-}
-
-/// Rewrites deprecated `[editor]` options into the ones that replace them, recording a
-/// message for each in `deprecations`.
-///
-/// * `conceal` (a boolean, or a table of language names) is `markdown-preview`, which wins
-///   when both are set. Of the table only `markdown` is read.
-fn migrate_deprecated(editor: &mut toml::Value, deprecations: &mut Vec<String>) {
-    let Some(table) = editor.as_table_mut() else {
-        return;
-    };
-    if let Some(conceal) = table.remove("conceal") {
-        let enabled = match &conceal {
-            toml::Value::Table(languages) => languages
-                .get("markdown")
-                .and_then(toml::Value::as_bool)
-                .unwrap_or(false),
-            other => other.as_bool().unwrap_or(true),
-        };
-        table
-            .entry("markdown-preview")
-            .or_insert(toml::Value::Boolean(enabled));
-        let message = "`editor.conceal` is deprecated, use `editor.markdown-preview`".to_string();
-        if !deprecations.contains(&message) {
-            deprecations.push(message);
         }
     }
 }
@@ -91,16 +60,10 @@ impl Config {
         global: Result<&String, ConfigLoadError>,
         local: Result<String, ConfigLoadError>,
     ) -> Result<Config, ConfigLoadError> {
-        let mut deprecations = Vec::new();
-        let mut parse = |file: &str| -> Result<ConfigRaw, ConfigLoadError> {
-            let mut config: ConfigRaw = toml::from_str(file).map_err(ConfigLoadError::BadConfig)?;
-            if let Some(editor) = &mut config.editor {
-                migrate_deprecated(editor, &mut deprecations);
-            }
-            Ok(config)
-        };
-        let global_config = global.and_then(|file| parse(file));
-        let local_config = local.and_then(|file| parse(&file));
+        let global_config: Result<ConfigRaw, ConfigLoadError> =
+            global.and_then(|file| toml::from_str(file).map_err(ConfigLoadError::BadConfig));
+        let local_config: Result<ConfigRaw, ConfigLoadError> =
+            local.and_then(|file| toml::from_str(&file).map_err(ConfigLoadError::BadConfig));
         let res = match (global_config, local_config) {
             (Ok(global), Ok(local)) => {
                 let mut keys = keymap::default();
@@ -125,7 +88,6 @@ impl Config {
                     theme: local.theme.or(global.theme),
                     keys,
                     editor,
-                    deprecations,
                 }
             }
             // if any configs are invalid return that first
@@ -145,7 +107,6 @@ impl Config {
                         || Ok(helix_view::editor::Config::default()),
                         |val| val.try_into().map_err(ConfigLoadError::BadConfig),
                     )?,
-                    deprecations,
                 }
             }
 
@@ -198,27 +159,6 @@ mod tests {
         fn load_test(config: &str) -> Config {
             Config::load(Ok(&config.to_owned()), Err(ConfigLoadError::default())).unwrap()
         }
-    }
-
-    #[test]
-    fn conceal_is_read_as_markdown_preview() {
-        let config = Config::load_test("");
-        assert!(config.editor.markdown_preview);
-        assert!(config.deprecations.is_empty());
-
-        let config = Config::load_test("[editor]\nconceal = false\n");
-        assert!(!config.editor.markdown_preview);
-        assert_eq!(config.deprecations.len(), 1);
-
-        let config = Config::load_test("[editor.conceal]\nmarkdown = false\n");
-        assert!(!config.editor.markdown_preview);
-        let config = Config::load_test("[editor.conceal]\nmarkdown = true\n");
-        assert!(config.editor.markdown_preview);
-
-        // The new option wins.
-        let config = Config::load_test("[editor]\nconceal = false\nmarkdown-preview = true\n");
-        assert!(config.editor.markdown_preview);
-        assert_eq!(config.deprecations.len(), 1);
     }
 
     #[test]
