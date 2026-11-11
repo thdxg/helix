@@ -38,12 +38,23 @@ pub enum GraphemeSource {
     VirtualText {
         highlight: Option<Highlight>,
     },
+    /// A grapheme of a conceal replacement after the first one. It stands in for
+    /// `codepoints` (0 or 1) of the hidden chars and is drawn in the style of the first
+    /// grapheme of the replacement, the style of the hidden text, so that a replacement such
+    /// as a `───` table border is one color however much longer it is than the hidden text.
+    ConcealReplacement {
+        codepoints: u32,
+    },
 }
 
 impl GraphemeSource {
     /// Returns whether this grapheme is virtual inline text
     pub fn is_virtual(self) -> bool {
-        matches!(self, GraphemeSource::VirtualText { .. })
+        matches!(
+            self,
+            GraphemeSource::VirtualText { .. }
+                | GraphemeSource::ConcealReplacement { codepoints: 0 }
+        )
     }
 
     pub fn is_eof(self) -> bool {
@@ -53,7 +64,8 @@ impl GraphemeSource {
 
     pub fn doc_chars(self) -> usize {
         match self {
-            GraphemeSource::Document { codepoints } => codepoints as usize,
+            GraphemeSource::Document { codepoints }
+            | GraphemeSource::ConcealReplacement { codepoints } => codepoints as usize,
             GraphemeSource::VirtualText { .. } => 0,
         }
     }
@@ -259,13 +271,13 @@ impl<'t> DocumentFormatter<'t> {
         let (graphemes, reserved) = self.conceal_rest.as_mut()?;
         match graphemes.next() {
             Some(grapheme) => {
-                let source = if *reserved > 0 {
+                let codepoints = if *reserved > 0 {
                     *reserved -= 1;
-                    GraphemeSource::Document { codepoints: 1 }
+                    1
                 } else {
-                    GraphemeSource::VirtualText { highlight: None }
+                    0
                 };
-                Some((grapheme, source))
+                Some((grapheme, GraphemeSource::ConcealReplacement { codepoints }))
             }
             None => {
                 self.conceal_rest = None;
