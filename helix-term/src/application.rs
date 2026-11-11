@@ -257,12 +257,6 @@ impl Application {
         ])
         .context("build signal handler")?;
 
-        // Last, so the startup status (e.g. "Loaded 1 file.") does not hide it.
-        let deprecations = &config.load().deprecations;
-        if !deprecations.is_empty() {
-            editor.set_warning(deprecations.join("; "));
-        }
-
         let app = Self {
             compositor,
             terminal,
@@ -571,13 +565,7 @@ impl Application {
 
         match refresh_config() {
             Ok(_) => {
-                let deprecations = &self.config.load().deprecations;
-                if deprecations.is_empty() {
-                    self.editor.set_status("Config refreshed");
-                } else {
-                    self.editor
-                        .set_warning(format!("Config refreshed; {}", deprecations.join("; ")));
-                }
+                self.editor.set_status("Config refreshed");
             }
             Err(err) => {
                 self.editor.set_error(err.to_string());
