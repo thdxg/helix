@@ -546,6 +546,17 @@ impl View {
             ));
         }
 
+        // Last, so the rows of an image are the ones right above the next line: the
+        // decoration that draws it relies on that order, see `inline_image`.
+        let images = doc.conceal_images(self.id);
+        if !images.is_empty() {
+            let blocks = crate::inline_image::layout(images, width, self.inner_height() as u16);
+            if !blocks.is_empty() {
+                text_annotations
+                    .add_line_annotation(Box::new(crate::inline_image::ImageLines::new(blocks)));
+            }
+        }
+
         text_annotations
     }
 

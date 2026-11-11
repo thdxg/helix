@@ -1,4 +1,4 @@
-; Markup hidden by `editor.conceal`, styled after glow's rendering.
+; Markup hidden by `editor.markdown-preview`, styled after glow's rendering.
 
 ; Emphasis (`*`, `_`), strong emphasis and strikethrough delimiters.
 (emphasis_delimiter) @conceal
@@ -16,7 +16,9 @@
 (full_reference_link ["[" "]"] @conceal)
 (full_reference_link (link_label) @conceal)
 
-; Images show as the description followed by the source.
+; Images show as the description followed by the source. Where the terminal can draw images,
+; the image itself is drawn below the line.
+(image (link_destination) @conceal.image)
 (image "!" @conceal)
 (image "[" @conceal)
 (image "]" @conceal (#set! conceal " → "))

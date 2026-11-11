@@ -433,26 +433,55 @@ impl<'a> TextRenderer<'a> {
         }
     }
 
+    /// The surface row of visual row `y` (as in [`LinePos::visual_line`], which counts the
+    /// rows scrolled out above the viewport by the vertical offset), or `None` when it is
+    /// outside the viewport.
+    fn surface_row(&self, y: u16) -> Option<u16> {
+        let row = (y as usize).checked_sub(self.offset.row)?;
+        (row < self.viewport.height as usize).then(|| self.viewport.y + row as u16)
+    }
+
     pub fn set_string(&mut self, x: u16, y: u16, string: &str, style: Style) {
-        if (y as usize) < self.offset.row {
+        let Some(y) = self.surface_row(y) else {
             return;
-        }
-        self.surface
-            .set_string(x, y + self.viewport.y, string, style)
+        };
+        self.surface.set_string(x, y, string, style)
     }
 
     pub fn set_stringn(&mut self, x: u16, y: u16, string: &str, width: usize, style: Style) {
-        if (y as usize) < self.offset.row {
+        let Some(y) = self.surface_row(y) else {
             return;
+        };
+        self.surface.set_stringn(x, y, string, width, style);
+    }
+
+    /// Puts `symbol` in the cell at column `col` of visual row `row`, as is: no width or
+    /// whitespace handling, for cells such as kitty image placeholders. Returns whether the
+    /// cell is inside the viewport (and was set).
+    pub fn set_cell(&mut self, row: usize, col: u16, symbol: &str, style: Style) -> bool {
+        let Some(row) = row.checked_sub(self.offset.row) else {
+            return false;
+        };
+        if row >= self.viewport.height as usize || col >= self.viewport.width {
+            return false;
         }
-        self.surface
-            .set_stringn(x, y + self.viewport.y, string, width, style);
+        self.surface[(self.viewport.x + col, self.viewport.y + row as u16)]
+            .set_symbol(symbol)
+            .set_style(style);
+        true
     }
 
     /// Sets the style of an area **within the text viewport* this accounts
     /// both for the renderers vertical offset and its viewport
     pub fn set_style(&mut self, mut area: Rect, style: Style) {
-        area = area.clip_top(self.offset.row as u16);
+        // Rows scrolled out above the viewport are cut off, the rest moved up by as many.
+        let offset = self.offset.row.min(u16::MAX as usize) as u16;
+        area = area.clip_top(offset.saturating_sub(area.y));
+        area.y = area.y.saturating_sub(offset);
+        area.height = area.height.min(self.viewport.height.saturating_sub(area.y));
+        if area.height == 0 {
+            return;
+        }
         area.y += self.viewport.y;
         self.surface.set_style(area, style);
     }
@@ -468,18 +497,11 @@ impl<'a> TextRenderer<'a> {
         ellipsis: bool,
         truncate_start: bool,
     ) -> (u16, u16) {
-        if (y as usize) < self.offset.row {
+        let Some(row) = self.surface_row(y) else {
             return (x, y);
-        }
-        self.surface.set_string_truncated(
-            x,
-            y + self.viewport.y,
-            string,
-            width,
-            style,
-            ellipsis,
-            truncate_start,
-        )
+        };
+        self.surface
+            .set_string_truncated(x, row, string, width, style, ellipsis, truncate_start)
     }
 }
 

@@ -1515,6 +1515,8 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         // written back after.
         let mut scroll = self.preview_scroll_offset;
 
+        // The images drawn into a text preview (`markdown-preview`), to transmit after drawing.
+        let drawn = std::cell::RefCell::new(Vec::new());
         if let Some((preview, range)) = self.get_preview(cx.editor) {
             // Images and PDFs are drawn as a graphics placement rather than as
             // text. Everything needed is copied out of the preview so that the
@@ -1625,33 +1627,43 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             };
             let doc_height = doc.text().len_lines();
 
-            // Hidden markup (`editor.conceal`), so the preview reads like the document does in
+            // Hidden markup (`editor.markdown-preview`), so the preview reads like the document does in
             // a view. Nothing is revealed: the preview has no cursor. Only the lines that can
             // be shown are computed: a screen around the range or the top, widened by the
             // preview scroll.
-            let conceals = {
+            let concealed = {
                 let config = cx.editor.config();
                 let loader = cx.editor.syn_loader.load();
-                match (doc.syntax(), doc.language_name()) {
-                    (Some(syntax), Some(language)) if config.conceal.enabled(language) => {
+                match doc.syntax() {
+                    Some(syntax) if config.markdown_preview => {
                         let height = inner.height as usize;
                         let base = range.map_or(0, |(start, _)| start);
                         let slack = height + scroll.unsigned_abs();
                         let lines = base.saturating_sub(slack)..base + slack + height;
-                        conceal::conceal_ranges(
-                            syntax,
-                            doc.text().slice(..),
-                            &loader,
-                            lines,
-                            |_| false,
-                        )
+                        conceal::conceal(syntax, doc.text().slice(..), &loader, lines, |_| false)
                     }
-                    _ => Vec::new(),
+                    _ => Default::default(),
                 }
             };
+            let conceals = concealed.conceals;
+            // Images below their lines, sized for the preview.
+            let image_blocks = helix_view::inline_image::layout(
+                &helix_view::inline_image::resolve(
+                    doc.text().slice(..),
+                    doc.path(),
+                    &concealed.images,
+                ),
+                inner.width,
+                inner.height,
+            );
             let annotations = || {
                 let mut annotations = TextAnnotations::default();
                 annotations.add_conceals(&conceals);
+                if !image_blocks.is_empty() {
+                    annotations.add_line_annotation(Box::new(
+                        helix_view::inline_image::ImageLines::new(image_blocks.clone()),
+                    ));
+                }
                 annotations
             };
 
@@ -1814,6 +1826,13 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
             let current_line = doc.text().slice(..).char_to_line(offset.anchor);
 
+            if !image_blocks.is_empty() {
+                decorations.add_decoration(crate::ui::text_decorations::InlineImages::new(
+                    image_blocks.clone(),
+                    &drawn,
+                ));
+            }
+
             render_document(
                 surface,
                 inner,
@@ -1858,6 +1877,12 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                     }
                 }
             }
+        }
+
+        for image in drawn.into_inner() {
+            cx.editor
+                .graphics
+                .ensure_placement(&image.raster, image.cols, image.rows);
         }
 
         // Persist the offset clamped against the layout above.

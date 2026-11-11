@@ -1,4 +1,4 @@
-; Markup hidden by `editor.conceal`, styled after glow's rendering.
+; Markup hidden by `editor.markdown-preview`, styled after glow's rendering.
 
 ; Headings: hide the marker and the space after it; the heading text keeps its highlight.
 ((atx_h1_marker) @conceal (#set! conceal.trailing-whitespace))

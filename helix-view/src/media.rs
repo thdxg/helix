@@ -327,6 +327,93 @@ fn base64(data: &[u8]) -> String {
     out
 }
 
+/// What document rendering needs to know about the terminal's graphics: set by the
+/// application once per frame, read wherever a document is laid out (inline images take
+/// rows, see `crate::inline_image`), which is not always where the editor is at hand.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GraphicsMetrics {
+    /// The size of a cell in pixels, when the terminal reports it.
+    pub cell_px: Option<(f32, f32)>,
+}
+
+static GRAPHICS_METRICS: Mutex<Option<GraphicsMetrics>> = Mutex::new(None);
+
+/// Records whether images can be drawn (`Some`) and the cell size. See [`GraphicsMetrics`].
+pub fn set_graphics_metrics(metrics: Option<GraphicsMetrics>) {
+    *GRAPHICS_METRICS.lock() = metrics;
+}
+
+/// `None` when the terminal cannot draw images. See [`GraphicsMetrics`].
+pub fn graphics_metrics() -> Option<GraphicsMetrics> {
+    *GRAPHICS_METRICS.lock()
+}
+
+#[derive(Debug, Clone)]
+enum InlineRaster {
+    Loading,
+    Ready(Raster),
+    Failed,
+}
+
+/// Rasters of images drawn inside documents, by file and modification time.
+static INLINE_RASTERS: std::sync::LazyLock<Mutex<HashMap<(PathBuf, SystemTime), InlineRaster>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The raster of an image file drawn inside a document, or `None` while it is being
+/// converted or when it cannot be drawn.
+///
+/// A PNG, or an image converted before (the PNG cache is on disk), is ready at once: only
+/// its header is read. Anything else is converted on a blocking task and a redraw is
+/// requested once it is done, so the document gains the image's rows a moment later.
+pub fn inline_raster(path: &Path, mtime: SystemTime) -> Option<Raster> {
+    let key = (path.to_path_buf(), mtime);
+    if let Some(state) = INLINE_RASTERS.lock().get(&key) {
+        return match state {
+            InlineRaster::Ready(raster) => Some(raster.clone()),
+            InlineRaster::Loading | InlineRaster::Failed => None,
+        };
+    }
+
+    let is_png = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("png"));
+    let cached = cache_slot(path, mtime, 0, 0).is_ok_and(|(cache, _)| cache.exists());
+    if is_png || cached {
+        let state = match image_to_png(path, mtime) {
+            Ok(raster) => InlineRaster::Ready(raster),
+            Err(err) => {
+                log::debug!("inline image {}: {err}", path.display());
+                InlineRaster::Failed
+            }
+        };
+        INLINE_RASTERS.lock().insert(key, state.clone());
+        return match state {
+            InlineRaster::Ready(raster) => Some(raster),
+            _ => None,
+        };
+    }
+
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return None;
+    };
+    INLINE_RASTERS
+        .lock()
+        .insert(key.clone(), InlineRaster::Loading);
+    runtime.spawn_blocking(move || {
+        let state = match image_to_png(&key.0, key.1) {
+            Ok(raster) => InlineRaster::Ready(raster),
+            Err(err) => {
+                log::debug!("inline image {}: {err}", key.0.display());
+                InlineRaster::Failed
+            }
+        };
+        INLINE_RASTERS.lock().insert(key, state);
+        helix_event::request_redraw();
+    });
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaKind {
     Image,

@@ -1351,7 +1351,7 @@ impl FoldQuery {
     }
 }
 
-/// The query that decides which markup a language hides when `editor.conceal` is on (see
+/// The query that decides which markup a language hides when `editor.markdown-preview` is on (see
 /// [`crate::conceal`]).
 ///
 /// A `conceal.scm` marks the hidden nodes with `@conceal`. Pattern properties refine a
@@ -1365,11 +1365,14 @@ impl FoldQuery {
 ///
 /// A node captured as `@conceal.table` is a table whose columns are lined up while it is
 /// concealed, see [`crate::conceal`]. Only tree-sitter-markdown's `pipe_table` is understood.
+/// A node captured as `@conceal.image` is the path of an image that is drawn below its line
+/// while the document is concealed.
 #[derive(Debug)]
 pub struct ConcealQuery {
     pub query: Query,
     conceal_capture: Option<Capture>,
     table_capture: Option<Capture>,
+    image_capture: Option<Capture>,
     replacements: foldhash::HashMap<Pattern, Tendril>,
     trim_whitespace: HashSet<Pattern>,
     trailing_whitespace: HashSet<Pattern>,
@@ -1409,6 +1412,7 @@ impl ConcealQuery {
         Ok(Self {
             conceal_capture: query.get_capture("conceal"),
             table_capture: query.get_capture("conceal.table"),
+            image_capture: query.get_capture("conceal.image"),
             query,
             replacements,
             trim_whitespace,
@@ -1424,6 +1428,12 @@ impl ConcealQuery {
     /// Whether a match of this query is a table to line up, see [`crate::conceal`].
     pub fn is_table(&self, capture: Capture) -> bool {
         self.table_capture == Some(capture)
+    }
+
+    /// Whether a match of this query is the path of an image to draw, see
+    /// [`crate::conceal::ConcealImage`].
+    pub fn is_image(&self, capture: Capture) -> bool {
+        self.image_capture == Some(capture)
     }
 
     /// The text displayed in place of the hidden text of `pattern`, empty for none.
