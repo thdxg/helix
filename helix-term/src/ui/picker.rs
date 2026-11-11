@@ -43,7 +43,7 @@ use std::{
 
 use crate::ui::{Prompt, PromptEvent};
 use helix_core::{
-    char_idx_at_visual_offset, fuzzy::MATCHER, movement::Direction,
+    char_idx_at_visual_offset, conceal, fuzzy::MATCHER, movement::Direction,
     text_annotations::TextAnnotations, unicode::segmentation::UnicodeSegmentation,
     visual_offset_from_anchor, Position,
 };
@@ -1625,6 +1625,36 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             };
             let doc_height = doc.text().len_lines();
 
+            // Hidden markup (`editor.conceal`), so the preview reads like the document does in
+            // a view. Nothing is revealed: the preview has no cursor. Only the lines that can
+            // be shown are computed: a screen around the range or the top, widened by the
+            // preview scroll.
+            let conceals = {
+                let config = cx.editor.config();
+                let loader = cx.editor.syn_loader.load();
+                match (doc.syntax(), doc.language_name()) {
+                    (Some(syntax), Some(language)) if config.conceal.enabled(language) => {
+                        let height = inner.height as usize;
+                        let base = range.map_or(0, |(start, _)| start);
+                        let slack = height + scroll.unsigned_abs();
+                        let lines = base.saturating_sub(slack)..base + slack + height;
+                        conceal::conceal_ranges(
+                            syntax,
+                            doc.text().slice(..),
+                            &loader,
+                            lines,
+                            |_| false,
+                        )
+                    }
+                    _ => Vec::new(),
+                }
+            };
+            let annotations = || {
+                let mut annotations = TextAnnotations::default();
+                annotations.add_conceals(&conceals);
+                annotations
+            };
+
             let mut offset = ViewPosition::default();
             if let Some((start_line, end_line)) = range {
                 let height = end_line - start_line;
@@ -1633,7 +1663,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 let middle = text.line_to_char(start_line + height / 2);
                 if height < inner.height as usize {
                     let text_fmt = doc.text_format(inner.width, None);
-                    let annotations = TextAnnotations::default();
+                    let annotations = annotations();
                     (offset.anchor, offset.vertical_offset) = char_idx_at_visual_offset(
                         text,
                         middle,
@@ -1662,7 +1692,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             if scroll != 0 {
                 let text = doc.text().slice(..);
                 let text_fmt = doc.text_format(inner.width, None);
-                let annotations = TextAnnotations::default();
+                let annotations = annotations();
                 let natural_anchor = offset.anchor;
 
                 let (anchor, vertical_offset) = char_idx_at_visual_offset(
@@ -1790,7 +1820,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 doc,
                 offset,
                 // TODO: compute text annotations asynchronously here (like inlay hints)
-                &TextAnnotations::default(),
+                &annotations(),
                 syntax_highlighter,
                 overlay_highlights,
                 &cx.editor.theme,

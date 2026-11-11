@@ -1534,7 +1534,9 @@ impl Document {
     /// it scrolls into view. The result feeds [`View::text_annotations`], so this runs before
     /// the view is scrolled or drawn, see [`View::ensure_cursor_in_view`].
     pub fn update_conceals(&mut self, view: &View) {
-        let enabled = self.config.load().conceal;
+        let enabled = self
+            .language_name()
+            .is_some_and(|language| self.config.load().conceal.enabled(language));
         let (Some(syntax), Some(selection), true) =
             (self.syntax.as_ref(), self.selections.get(&view.id), enabled)
         else {
