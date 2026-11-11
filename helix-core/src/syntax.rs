@@ -1362,10 +1362,14 @@ impl FoldQuery {
 ///   visible, for tokens such as list markers that include the space after them.
 /// * `(#set! conceal.trailing-whitespace)` hides the spaces and tabs after the node too,
 ///   for markers such as `#` whose following space is not part of any node.
+///
+/// A node captured as `@conceal.table` is a table whose columns are lined up while it is
+/// concealed, see [`crate::conceal`]. Only tree-sitter-markdown's `pipe_table` is understood.
 #[derive(Debug)]
 pub struct ConcealQuery {
     pub query: Query,
     conceal_capture: Option<Capture>,
+    table_capture: Option<Capture>,
     replacements: foldhash::HashMap<Pattern, Tendril>,
     trim_whitespace: HashSet<Pattern>,
     trailing_whitespace: HashSet<Pattern>,
@@ -1404,6 +1408,7 @@ impl ConcealQuery {
 
         Ok(Self {
             conceal_capture: query.get_capture("conceal"),
+            table_capture: query.get_capture("conceal.table"),
             query,
             replacements,
             trim_whitespace,
@@ -1414,6 +1419,11 @@ impl ConcealQuery {
     /// Whether a match of this query marks hidden text.
     pub fn is_conceal(&self, capture: Capture) -> bool {
         self.conceal_capture == Some(capture)
+    }
+
+    /// Whether a match of this query is a table to line up, see [`crate::conceal`].
+    pub fn is_table(&self, capture: Capture) -> bool {
+        self.table_capture == Some(capture)
     }
 
     /// The text displayed in place of the hidden text of `pattern`, empty for none.

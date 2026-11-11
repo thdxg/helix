@@ -27,6 +27,5 @@
 (fenced_code_block_delimiter) @conceal
 (info_string) @conceal
 
-; Tables.
-(pipe_table_header "|" @conceal (#set! conceal "│"))
-(pipe_table_row "|" @conceal (#set! conceal "│"))
+; Tables: the columns are lined up and the pipes drawn as box lines by the editor.
+(pipe_table) @conceal.table

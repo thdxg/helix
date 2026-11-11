@@ -302,6 +302,49 @@ where
     Ok(chars)
 }
 
+/// `editor.conceal`: the languages whose markup is hidden, by language name.
+///
+/// ```toml
+/// [editor.conceal]
+/// markdown = true
+/// ```
+///
+/// A language that is not listed is not concealed. A plain boolean is accepted too:
+/// `conceal = true` is the default table and `conceal = false` turns concealing off for every
+/// language.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct ConcealConfig(pub BTreeMap<String, bool>);
+
+impl ConcealConfig {
+    /// Whether markup of the language named `language` is hidden.
+    pub fn enabled(&self, language: &str) -> bool {
+        self.0.get(language).copied().unwrap_or(false)
+    }
+}
+
+impl Default for ConcealConfig {
+    fn default() -> Self {
+        Self(BTreeMap::from([("markdown".to_string(), true)]))
+    }
+}
+
+impl<'de> Deserialize<'de> for ConcealConfig {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            All(bool),
+            Languages(BTreeMap<String, bool>),
+        }
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::All(true) => Self::default(),
+            Repr::All(false) => Self(BTreeMap::new()),
+            Repr::Languages(languages) => Self(languages),
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
 pub struct Config {
@@ -443,10 +486,10 @@ pub struct Config {
     pub editor_config: bool,
     /// Whether to render rainbow colors for matching brackets. Defaults to `false`.
     pub rainbow_brackets: bool,
-    /// Whether to hide markup, such as the `**` around bold markdown, in languages that ship
-    /// a `conceal.scm` query. Lines holding a cursor or selection show the markup. Defaults
-    /// to `true`.
-    pub conceal: bool,
+    /// Which languages hide markup, such as the `**` around bold markdown, keyed by language
+    /// name. Only languages that ship a `conceal.scm` query can hide anything. Lines holding
+    /// a cursor or selection show the markup. Defaults to `{ markdown = true }`.
+    pub conceal: ConcealConfig,
     /// Whether to enable Kitty Keyboard Protocol
     pub kitty_keyboard_protocol: KittyKeyboardProtocolConfig,
     /// Graphical rendering of images/PDFs (kitty graphics protocol).
@@ -1386,7 +1429,7 @@ impl Default for Config {
             clipboard_provider: ClipboardProvider::default(),
             editor_config: true,
             rainbow_brackets: false,
-            conceal: true,
+            conceal: ConcealConfig::default(),
             kitty_keyboard_protocol: Default::default(),
             image_rendering: Default::default(),
             buffer_picker: BufferPickerConfig::default(),
@@ -2998,8 +3041,25 @@ impl CursorCache {
 
 #[cfg(test)]
 mod test {
-    use super::{ClipboardMode, ExplorerClipboard};
+    use super::{ClipboardMode, Config, ExplorerClipboard};
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn conceal_is_configured_per_language() {
+        let config: Config = toml::from_str("[conceal]\nmarkdown = false\nnorg = true\n").unwrap();
+        assert!(!config.conceal.enabled("markdown"));
+        assert!(config.conceal.enabled("norg"));
+        assert!(!config.conceal.enabled("rust"));
+
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.conceal.enabled("markdown"));
+
+        // The boolean form from before the table.
+        let config: Config = toml::from_str("conceal = true").unwrap();
+        assert!(config.conceal.enabled("markdown"));
+        let config: Config = toml::from_str("conceal = false").unwrap();
+        assert!(!config.conceal.enabled("markdown"));
+    }
 
     #[test]
     fn a_cut_is_spent_by_the_paste_that_carries_it_out() {
