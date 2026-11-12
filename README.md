@@ -1,4 +1,4 @@
-# Helix (thdxg fork)
+# Helix (fork by [thdxg](https://github.com/thdxg))
 
 A fork of [mattwparas/helix](https://github.com/mattwparas/helix)'s
 `steel-event-system` branch (Helix plus the [Steel](https://github.com/mattwparas/steel)
@@ -66,5 +66,4 @@ runtime and grammar setup.
 ## Credits
 
 Built on [Helix](https://helix-editor.com) and
-[mattwparas/helix](https://github.com/mattwparas/helix). Logo by
-[@jakenvac](https://github.com/jakenvac).
+[mattwparas/helix](https://github.com/mattwparas/helix).
