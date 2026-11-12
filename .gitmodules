@@ -1,12 +1,3 @@
-[submodule "plugins/helix-file-watcher"]
-	path = plugins/helix-file-watcher
-	url = https://github.com/mattwparas/helix-file-watcher.git
-[submodule "plugins/smooth-scroll.hx"]
-	path = plugins/smooth-scroll.hx
-	url = https://github.com/thomasschafer/smooth-scroll.hx.git
-[submodule "plugins/wakatime.hx"]
-	path = plugins/wakatime.hx
-	url = https://github.com/Xerxes-2/wakatime.hx.git
 [submodule "plugins/macterm-splits.hx"]
 	path = plugins/macterm-splits.hx
 	url = git@github.com:thdxg/macterm-splits.hx.git

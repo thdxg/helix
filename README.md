@@ -1,94 +1,70 @@
-<div align="center">
+# Helix (thdxg fork)
 
-<h1>
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="logo_dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="logo_light.svg">
-  <img alt="Helix" height="128" src="logo_light.svg">
-</picture>
-</h1>
+A fork of [mattwparas/helix](https://github.com/mattwparas/helix)'s
+`steel-event-system` branch (Helix plus the [Steel](https://github.com/mattwparas/steel)
+plugin system). Everything below is added on top of it. Options are documented
+in [`book/src/editor.md`](book/src/editor.md) and [`book/src/keymap.md`](book/src/keymap.md).
 
-[![Build status](https://github.com/helix-editor/helix/actions/workflows/build.yml/badge.svg)](https://github.com/helix-editor/helix/actions)
-[![GitHub Release](https://img.shields.io/github/v/release/helix-editor/helix)](https://github.com/helix-editor/helix/releases/latest)
-[![Documentation](https://shields.io/badge/-documentation-452859)](https://docs.helix-editor.com/)
-[![GitHub contributors](https://img.shields.io/github/contributors/helix-editor/helix)](https://github.com/helix-editor/helix/graphs/contributors)
-[![Matrix Space](https://img.shields.io/matrix/helix-community:matrix.org)](https://matrix.to/#/#helix-community:matrix.org)
+## Features
 
-</div>
+**Files**
+- **Auto-reload on external change.** File watching reloads unmodified buffers
+  when the file changes on disk; modified buffers get a conflict warning
+  (`[editor.auto-reload]`).
+- **Deleted files keep their buffer.** Like Vim, the buffer stays open and is
+  marked modified; `:w` recreates the file.
+- **Live git gutter.** The diff gutter updates when git state changes.
 
-![Screenshot](./screenshot.png)
+**Images and PDFs**
+- Open them with `:open` and they render in the view through the kitty graphics
+  protocol. Page PDFs with `h`/`k`, `j`/`l`, the mouse wheel, goto-line keys,
+  `:media-next-page`, `:media-prev-page` and `:media-goto-page N`.
+- The file picker previews them too. Requires `pdftoppm` for PDFs and
+  `magick`/`convert`/`sips` for non-PNG images (`editor.image-rendering`).
 
-A [Kakoune](https://github.com/mawww/kakoune) / [Neovim](https://github.com/neovim/neovim) inspired editor, written in Rust.
+**Pickers**
+- **Modal pickers.** Opt in with `editor.picker.modal` to drive pickers with
+  bare keys; `default-mode` sets whether they open in insert or normal mode.
+- **File explorer.** Create, delete, move, copy, cut, paste (yazi-style numbered
+  names, `P` to overwrite) and yank paths. `h`/`l` walk the tree, symlinks are
+  marked, and the tree rereads when it changes on disk. It can open on the
+  current buffer.
+- **Buffer line search** and a **scrollable file preview**.
 
-The editing model is very heavily based on Kakoune; during development I found
-myself agreeing with most of Kakoune's design decisions.
+**Editing and rendering**
+- **Code folding** from tree-sitter, with `folds.scm` queries per language.
+- **Markdown preview.** Markdown reads like rendered text: markup such as `**`
+  and `#` is hidden except on lines with a cursor or selection, tables are
+  aligned and boxed, and local images are drawn below their lines
+  (`editor.markdown-preview`, `:toggle markdown-preview`).
+- **Terminal scroll regions** for scrolling, so terminals that animate scrolling
+  show the motion (`editor.smooth-scroll`).
+- **Soft-wrap indicators** in the line-number gutter.
+- **`native` cursor shape**, which leaves the cursor to the terminal.
+- **Alloy 6** as the `als` language, plus Go import path highlighting.
 
-For more information, see the [website](https://helix-editor.com) or
-[documentation](https://docs.helix-editor.com/).
+**Performance and plugins**
+- **Fast `:q`.** The LSP shutdown wait is capped, and a PDF still rendering no
+  longer holds up quit.
+- **Steel boots in the background**, and `init.scm` runs after the first frame.
+- **Plugin hooks.** Steel plugins can handle file-picker opens
+  (`set-file-picker-open-handler!`). Bundled plugins:
+  [`macterm-splits.hx`](https://github.com/thdxg/macterm-splits.hx) and
+  [`comment.hx`](https://github.com/thdxg/comment.hx).
 
-All shortcuts/keymaps can be found [in the documentation on the website](https://docs.helix-editor.com/keymap.html).
+## Building
 
-[Troubleshooting](https://github.com/helix-editor/helix/wiki/Troubleshooting)
+```sh
+git clone --recurse-submodules https://github.com/thdxg/helix
+cd helix
+cargo install --path helix-term --locked
+```
 
-# Changes in this fork
+See the [installation docs](https://docs.helix-editor.com/install.html) for
+runtime and grammar setup.
 
-This repo tracks [mattwparas/helix](https://github.com/mattwparas/helix)'s
-`steel-event-system` branch (upstream Helix plus the
-[Steel](https://github.com/mattwparas/steel) plugin system, customizable
-statusline, and code actions on save) and adds the following on top:
+## Credits
 
-- **File watching with external-change auto-reload** — unmodified buffers
-  reload automatically when their files change on disk (macOS backend via
-  filesentry); modified buffers surface a conflict warning instead
-  (`helix-view/src/document.rs`, `[editor.auto-reload]`).
-- **Vim-style handling of externally deleted files** — when an open file is
-  deleted from disk the buffer is kept and marked modified rather than
-  closed; `:w` recreates the file.
-- **Snappy `:q` with LSP servers running** — the shutdown flush wait is
-  capped so quitting no longer hangs ~1s per language server.
-- **Image and PDF rendering in the editor** — `:open` on an image
-  (png/jpeg/gif/webp/svg/…) or PDF renders it in the view via the kitty
-  graphics protocol (unicode placeholder placements), scaled to fit,
-  aspect-preserved, read-only. PDFs page with `h`/`k` (previous) and
-  `j`/`l` (next) — arrow keys too — plus `:media-next-page`,
-  `:media-prev-page`, and `:media-goto-page N` (bindable like any typable
-  command). Auto-detected on kitty/ghostty-family terminals; configurable
-  with `editor.image-rendering = "auto" | "kitty" | "disabled"`. PDF pages
-  rasterize through `pdftoppm` (poppler); non-PNG images convert through
-  `magick`/`convert`/`sips`, whichever is present. Terminals without
-  graphics support get a text fallback instead of binary garbage.
-- **Steel/event fixes** — `send_blocking` no longer panics without a tokio
-  reactor; Steel pinned past a thread-spawning bug.
-
-# Features
-
-- Vim-like modal editing
-- Multiple selections
-- Built-in language server support
-- Smart, incremental syntax highlighting and code editing via tree-sitter
-
-Although it's primarily a terminal-based editor, I am interested in exploring
-a custom renderer (similar to Emacs) using wgpu.
-
-Note: Only certain languages have indentation definitions at the moment. Check
-`runtime/queries/<lang>/` for `indents.scm`.
-
-# Installation
-
-[Installation documentation](https://docs.helix-editor.com/install.html).
-
-[![Packaging status](https://repology.org/badge/vertical-allrepos/helix-editor.svg?exclude_unsupported=1)](https://repology.org/project/helix-editor/versions)
-
-# Contributing
-
-Contributing guidelines can be found [here](./docs/CONTRIBUTING.md).
-
-# Getting help
-
-Your question might already be answered on the [FAQ](https://github.com/helix-editor/helix/wiki/FAQ).
-
-Discuss the project on the community [Matrix Space](https://matrix.to/#/#helix-community:matrix.org) (make sure to join `#helix-editor:matrix.org` if you're on a client that doesn't support Matrix Spaces yet).
-
-# Credits
-
-Thanks to [@jakenvac](https://github.com/jakenvac) for designing the logo!
+Built on [Helix](https://helix-editor.com) and
+[mattwparas/helix](https://github.com/mattwparas/helix). Logo by
+[@jakenvac](https://github.com/jakenvac).
